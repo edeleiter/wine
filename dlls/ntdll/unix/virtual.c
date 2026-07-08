@@ -2025,6 +2025,8 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  * mprotect afterwards, so we never re-arm what we just warmed. Only 4-aligned 0xd65f03c0 words are
  * branched to (they decode+execute as `ret` and return to LR regardless of surrounding bytes). The
  * scanned range is exactly what mprotect_range just protected (host-page rounded), so no over-read. */
+void *proton_wledger[16384]; int proton_wledger_n;   /* WLEDGER-REMOVE: independent record of warmed pages */
+
 /* proton-mac: warm a 16KB RX page that has no aligned `ret` to branch to (a dense mid-function page).
  * We can't blr into it (executing a real instruction with x18=0 could fault/corrupt) and can't mprotect
  * it writable (that re-arms the clobber). Instead mach_vm_remap an RW alias of the SAME physical page,
@@ -2079,6 +2081,7 @@ static void warm_exec_range( void *base, size_t size )
             }
         }
         if (!warmed) warm_noret_page( page );    /* no ret to branch to: alias-plant one, then warm */
+        if (proton_wledger_n < 16384) proton_wledger[proton_wledger_n++] = page;   /* WLEDGER-REMOVE */
     }
 }
 #endif

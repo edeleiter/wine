@@ -1162,6 +1162,16 @@ static inline void restore_teb_register(void)
     __asm__ volatile( "mov x18, %0" :: "r"(pthread_getspecific( teb_key )) : "memory" );
 }
 #define RESTORE_TEB_REGISTER() restore_teb_register()
+int proton_c_usr1, proton_c_usr2, proton_c_trap;   /* SIGCENSUS-REMOVE: async/trap counts (no I/O in handlers) */
+extern void *proton_wledger[]; extern int proton_wledger_n;   /* WLEDGER-REMOVE */
+int proton_cf_warmed, proton_cf_cold;   /* WLEDGER-REMOVE: recovered [x18] faults on warmed vs unwarmed pages */
+static int proton_page_warmed( ULONG64 pc )
+{
+    void *pg = (void *)((ULONG_PTR)pc & ~(ULONG_PTR)0x3fff);   /* 16KB host page */
+    int i;
+    for (i = 0; i < proton_wledger_n; i++) if (proton_wledger[i] == pg) return 1;
+    return 0;
+}
 
 /* proton-mac: emulate a faulting [x18,#imm] integer load/store IN the handler and advance PC,
  * instead of re-executing it on the cold RX page (whose first execution re-zeroes x18 -> the
@@ -1243,11 +1253,41 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         ULONG instr = *(ULONG *)PC_sig( context );   /* PC just fetched -> page mapped, safe read */
         if (((instr >> 5) & 0x1f) == 18)             /* AArch64 load/store base register Rn (bits[9:5]) == x18 */
         {
+            if (proton_page_warmed( PC_sig(context) )) proton_cf_warmed++; else proton_cf_cold++;  /* WLEDGER-REMOVE */
             if (emulate_teb_load_store( context, instr ))
                 PC_sig( context ) += 4;              /* emulated: skip past the faulting instruction */
             /* else: unhandled form -> resume at the same PC (best-effort, as before) */
             redirect_x18_resume( context );          /* trampoline reloads x18=TEB, resumes at PC(+4) */
             return;
+        }
+        else if ((ULONG_PTR)siginfo->si_addr < 0x10000)
+        {   /* proton-mac: FEX materializes TEB into a SCRATCH reg (`add x8,x18,x0`), so the fault's base is
+             * xN (not x18) and the [x18]-only net above misses it. macOS zeroed x18 upstream, so xN = 0+off.
+             * Robust recovery WITHOUT emulation: fix the derived base (xN += TEB), reload x18=TEB, and
+             * RE-EXECUTE the same instruction in hardware (no PC advance) — the store/load then lands at the
+             * real TEB-relative address. No width/sign/pair decode to get wrong. Gated to near-null faults
+             * (< 64KB: the null guard region, never mapped -> no silent-corruption risk). */
+            unsigned rn = (instr >> 5) & 0x1f;
+            ULONG64 teb = (ULONG64)(ULONG_PTR)pthread_getspecific( teb_key );
+            if (rn != 31) REGn_sig( rn, context ) = teb + REGn_sig( rn, context );  /* base now points into TEB */
+            redirect_x18_resume( context );   /* reload x18=TEB, resume at the SAME PC -> re-exec succeeds */
+            return;
+        }
+    }
+    {   /* SIGCENSUS-REMOVE: dump async/trap counts at the FIRST un-recovered near-null fault (the crash).
+         * Answers: did a sigreturn (usr1/usr2/trap) precede the x18=0 crash? */
+        static int dumped;
+        DWORD64 fa = (DWORD64)siginfo->si_addr;
+        if (!dumped && (esr & 0xf0000000) != 0x80000000 && fa < 0x10000)
+        {
+            const ULONG *sp = (const ULONG *)(PC_sig(context) & ~(ULONG_PTR)0x3fff);   /* WLEDGER-REMOVE */
+            const ULONG *se = sp + 0x1000; int hasret = 0;                              /* scan crash 16KB page */
+            for (; sp < se; sp++) if (*sp == 0xd65f03c0) { hasret = 1; break; }
+            dumped = 1;
+            ERR( "SIGCENSUS-CRASH pc=%llx fa=%llx x18=%llx crashpg_warmed=%d crashpg_hasret=%d | usr1=%d usr2=%d trap=%d | recovered[x18] on warmed=%d cold=%d | ledger_n=%d\n",
+                 (unsigned long long)PC_sig(context), (unsigned long long)fa,
+                 (unsigned long long)REGn_sig(18,context), proton_page_warmed( PC_sig(context) ), hasret,
+                 proton_c_usr1, proton_c_usr2, proton_c_trap, proton_cf_warmed, proton_cf_cold, proton_wledger_n );
         }
     }
 #endif
@@ -1274,6 +1314,12 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *context = sigcontext;
 
     RESTORE_TEB_REGISTER();
+    { static int n; if (n++ < 4)   /* ILLDIAG-REMOVE: capture the FEX ForcedAssert caller + args */
+        ERR( "ILLDIAG pc=%llx instr=%08x lr=%llx x0=%llx x1=%llx x2=%llx x8=%llx\n",
+             (unsigned long long)PC_sig(context), (unsigned)*(ULONG*)PC_sig(context),
+             (unsigned long long)REGn_sig(30,context), (unsigned long long)REGn_sig(0,context),
+             (unsigned long long)REGn_sig(1,context), (unsigned long long)REGn_sig(2,context),
+             (unsigned long long)REGn_sig(8,context) ); }
     if (!(PSTATE_sig( context ) & 0x10) && /* AArch64 (not WoW) */
         !(PC_sig( context ) & 3))
     {
@@ -1318,6 +1364,9 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     CONTEXT ctx;
 
     RESTORE_TEB_REGISTER();
+#ifdef __APPLE__
+    proton_c_trap++;   /* SIGCENSUS-REMOVE */
+#endif
     rec.ExceptionAddress = (void *)PC_sig(context);
     save_context( &ctx, sigcontext );
 
@@ -1481,6 +1530,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     CONTEXT context;
 
     RESTORE_TEB_REGISTER();
+#ifdef __APPLE__
+    proton_c_usr1++;   /* SIGCENSUS-REMOVE */
+#endif
     if (is_arm64ec_suspend_doorbell_valid() &&
         (NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation || NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback))
     {
@@ -1518,6 +1570,9 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     DWORD i;
 
     RESTORE_TEB_REGISTER();
+#ifdef __APPLE__
+    proton_c_usr2++;   /* SIGCENSUS-REMOVE */
+#endif
     frame = get_syscall_frame();
     if (!is_inside_syscall( SP_sig(context) )) return;
 
