@@ -2006,6 +2006,83 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
 }
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *           warm_exec_range
+ *
+ * proton-mac: exec-warm a range of RX pages. On Apple Silicon the FIRST execution of a freshly-RX page
+ * zeroes x18 (Apple's reserved platform register = the Windows ARM64 TEB reg). Real code that
+ * materializes the TEB into a scratch register before dereferencing (e.g. FEX's `add x8,x18,#off ;
+ * str [x8,...]`) then faults with base != x18, which the reactive segv_handler net (Rn==18) can't
+ * recover -> process aborts (proven: FEX ProcessInit dies in rpmalloc's first TLS write). We
+ * proactively execute a bare `ret` on each 16KB host page so x18 is never 0 when real code first runs
+ * there (per-16KB-page, proven in spikes/s1a/p2-x18-transfer). This must fire on EVERY transition to
+ * RX — not just the initial image map — because `mprotect(RW->RX)` re-arms the clobber (`execwarm.c`):
+ * a relocated builtin (loaded off its preferred base, like FEX) has its .text made RW then RX again by
+ * perform_relocations AFTER the map, re-cooling it. Hooking set_vprot (called for both the image map
+ * and the relocation re-protect) re-warms after each. Safety: a bare `ret` reads no memory -> cannot
+ * fault -> safe even under virtual_mutex with signals blocked (a fault would deadlock/kill); we do NO
+ * mprotect afterwards, so we never re-arm what we just warmed. Only 4-aligned 0xd65f03c0 words are
+ * branched to (they decode+execute as `ret` and return to LR regardless of surrounding bytes). The
+ * scanned range is exactly what mprotect_range just protected (host-page rounded), so no over-read. */
+/* proton-mac: warm a 16KB RX page that has no aligned `ret` to branch to (a dense mid-function page).
+ * We can't blr into it (executing a real instruction with x18=0 could fault/corrupt) and can't mprotect
+ * it writable (that re-arms the clobber). Instead mach_vm_remap an RW alias of the SAME physical page,
+ * plant a `ret` at offset 0 through the alias, blr to page+0 on the RX view to warm it, then restore the
+ * original word through the alias. Alias writes do NOT re-cool the exec side (proven:
+ * spikes/s1a/p2-x18-transfer/alias_warm.c), and no mprotect is done, so the page stays warm with its
+ * original bytes. Runs under virtual_mutex on a freshly-mapped page no one else is executing, so the
+ * transient `ret` at offset 0 is unobserved. */
+static void warm_noret_page( char *page )
+{
+    mach_vm_address_t alias = 0;
+    vm_prot_t cur = 0, max = 0;
+    volatile ULONG *aw;
+    ULONG saved;
+
+    if (mach_vm_remap( mach_task_self(), &alias, host_page_size, 0, VM_FLAGS_ANYWHERE,
+                       mach_task_self(), (mach_vm_address_t)(ULONG_PTR)page, FALSE,
+                       &cur, &max, VM_INHERIT_NONE )) return;
+    if (mach_vm_protect( mach_task_self(), alias, host_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE ))
+    {
+        mach_vm_deallocate( mach_task_self(), alias, host_page_size );
+        return;
+    }
+    aw = (volatile ULONG *)(ULONG_PTR)alias;     /* alias of page + 0 */
+    saved = *aw;
+    *aw = 0xd65f03c0;                            /* plant `ret` via the RW alias */
+    __asm__ volatile( "dsb ish\n\t isb" ::: "memory" );
+    __asm__ volatile( "mov x18, xzr\n\t blr %0" :: "r"(page) : "x18", "lr", "memory" );  /* warm */
+    *aw = saved;                                 /* restore original bytes via the alias (no re-cool) */
+    __asm__ volatile( "dsb ish\n\t isb" ::: "memory" );
+    mach_vm_deallocate( mach_task_self(), alias, host_page_size );
+}
+
+static void warm_exec_range( void *base, size_t size )
+{
+    char *page = ROUND_ADDR( base, host_page_mask );
+    char *end  = page + ROUND_SIZE( base, size, host_page_mask );
+
+    for (; page < end; page += host_page_size)
+    {
+        const ULONG *scan = (const ULONG *)page;
+        const ULONG *scan_end = (const ULONG *)(page + host_page_size);
+        BOOL warmed = FALSE;
+
+        for (; scan < scan_end; scan++)
+        {
+            if (*scan == 0xd65f03c0)   /* AArch64 `ret` — branch to it warms this 16KB page */
+            {
+                __asm__ volatile( "mov x18, xzr\n\t blr %0" :: "r"(scan) : "x18", "lr", "memory" );
+                warmed = TRUE;
+                break;
+            }
+        }
+        if (!warmed) warm_noret_page( page );    /* no ret to branch to: alias-plant one, then warm */
+    }
+}
+#endif
+
 /***********************************************************************
  *           set_vprot
  *
@@ -2024,7 +2101,13 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
         else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
         set_page_vprot( base, size, vprot );
     }
-    return !mprotect_range( base, size, 0, 0 );
+    if (mprotect_range( base, size, 0, 0 )) return FALSE;
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* proton-mac: re-warm exec pages after every ->RX transition (map AND relocation re-protect),
+     * so first-exec never runs with x18=0 (see warm_exec_range). */
+    if (vprot & VPROT_EXEC) warm_exec_range( base, size );
+#endif
+    return TRUE;
 }
 
 
@@ -3414,6 +3497,7 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
 
     return map_view( view_ret, NULL, size, top_down ? MEM_TOP_DOWN : 0, vprot, limit_low, limit_high, 0 );
 }
+
 
 
 /***********************************************************************
