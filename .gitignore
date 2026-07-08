@@ -1,0 +1,15 @@
+*.o
+*.a
+*.so
+*.res
+*.fake
+*.tab.c
+*.tab.h
+*.yy.c
+/config.log
+/config.status
+/config.cache
+/configure.lineno
+/include/config.h
+/include/stamp-h
+Makefile
