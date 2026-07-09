@@ -1257,29 +1257,27 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         ULONG instr = *(ULONG *)PC_sig( context );   /* PC just fetched -> page mapped, safe read */
         if (((instr >> 5) & 0x1f) == 18)             /* AArch64 load/store base register Rn (bits[9:5]) == x18 */
         {
-            if (proton_page_warmed( PC_sig(context) )) proton_cf_warmed++; else proton_cf_cold++;  /* WLEDGER-REMOVE */
-            /* proton-mac: RE-EXECUTE with x18=TEB delivered by the trampoline (matches the [xN] path below),
-             * instead of emulating + PC+=4. Emulation writes the destination register in-handler, but the
-             * trampoline sacrifices x17 — so when the destination IS x17 (FEX's `enter_jit`:
-             * `ldr x17,[x18,#0x1788]`) the emulated value was destroyed and the next insn stored through a
-             * bad x17. Re-executing lets the instruction reload its own destination from x18=TEB, making the
-             * x17 sacrifice harmless. (The old cold-page re-fault loop this avoided no longer bites here:
-             * these pages are warm by guest-transition time.) */
-            redirect_x18_resume( context );
+            /* proton-mac REGISTER-TRANSPARENT recovery (A2): EMULATE the [x18,#imm] load/store in-handler and
+             * advance PC by 4. x18 is left 0 — subsequent TEB accesses simply re-fault and re-recover. This
+             * clobbers NO register (an emulated load writes only its own destination), unlike the retired
+             * x18_resume_trampoline which sacrificed x17: fatal once guest execution reached code where x17
+             * is live (FEX EC-dispatch holds CPUArea in x17, e.g. `enter_jit`). Emulating (not re-executing)
+             * also avoids the cold-page re-fault loop. */
+            if (emulate_teb_load_store( context, instr ))
+                PC_sig( context ) += 4;
+            else
+                ERR( "A2: unhandled [x18] form %08x at pc=%llx\n", (unsigned)instr, (unsigned long long)PC_sig(context) );
             return;
         }
         else if ((ULONG_PTR)siginfo->si_addr < 0x10000)
-        {   /* proton-mac: FEX materializes TEB into a SCRATCH reg (`add x8,x18,x0`), so the fault's base is
-             * xN (not x18) and the [x18]-only net above misses it. macOS zeroed x18 upstream, so xN = 0+off.
-             * Robust recovery WITHOUT emulation: fix the derived base (xN += TEB), reload x18=TEB, and
-             * RE-EXECUTE the same instruction in hardware (no PC advance) — the store/load then lands at the
-             * real TEB-relative address. No width/sign/pair decode to get wrong. Gated to near-null faults
-             * (< 64KB: the null guard region, never mapped -> no silent-corruption risk). */
+        {   /* Derived-base [xN] (FEX materializes TEB into a scratch: `add x8,x18,x0; str [x8,#imm]`, so the
+             * fault's base is xN≠x18 and xN = 0+off). Fix the derived base (xN += TEB) and RE-EXECUTE (no PC
+             * advance): the instruction uses xN (not x18), so it lands at the real TEB address even with x18
+             * still 0 — no trampoline, register-transparent. Gated to near-null (<64KB, never mapped). */
             unsigned rn = (instr >> 5) & 0x1f;
             ULONG64 teb = (ULONG64)(ULONG_PTR)pthread_getspecific( teb_key );
             if (rn != 31) REGn_sig( rn, context ) = teb + REGn_sig( rn, context );  /* base now points into TEB */
-            redirect_x18_resume( context );   /* reload x18=TEB, resume at the SAME PC -> re-exec succeeds */
-            return;
+            return;                            /* re-execute at the same PC with the corrected base */
         }
     }
     {   /* SIGCENSUS-REMOVE: dump async/trap counts at the FIRST un-recovered near-null fault (the crash).
@@ -1301,9 +1299,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #endif
     if (!virtual_handle_fault( &rec, (void *)SP_sig(context) ))
     {
-#ifdef __APPLE__
-        redirect_x18_resume( context );  /* fault handled; resumed instr must have x18=TEB */
-#endif
+        /* proton-mac: no trampoline (register-transparent A2). If the resumed instruction needs x18=TEB it
+         * will re-fault and re-recover; nothing is clobbered. */
         return;
     }
     if (handle_syscall_fault( context, &rec )) return;
@@ -1359,9 +1356,11 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     RESTORE_TEB_REGISTER();
 #ifdef __APPLE__
     { static int n; if (n++ < 6)   /* BUSDIAG-REMOVE: characterize the alignment fault (atomic vs plain) */
-        ERR( "BUSDIAG pc=%llx instr=%08x fa=%llx lr=%llx\n",
+        ERR( "BUSDIAG pc=%llx instr=%08x fa=%llx lr=%llx x16=%llx x17=%llx x18=%llx\n",
              (unsigned long long)PC_sig(context), (unsigned)*(ULONG*)PC_sig(context),
-             (unsigned long long)(ULONG_PTR)siginfo->si_addr, (unsigned long long)REGn_sig(30,context) ); }
+             (unsigned long long)(ULONG_PTR)siginfo->si_addr, (unsigned long long)REGn_sig(30,context),
+             (unsigned long long)REGn_sig(16,context), (unsigned long long)REGn_sig(17,context),
+             (unsigned long long)REGn_sig(18,context) ); }
 #endif
     setup_exception( sigcontext, &rec );
 }
