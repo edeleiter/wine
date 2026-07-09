@@ -1157,13 +1157,13 @@ static BOOL emulate_teb_load_store( ucontext_t *context, ULONG instr )
         unsigned int imm12 = (instr >> 10) & 0xfff;
         addr = (BYTE *)teb + ((ULONG_PTR)imm12 << size);
     }
-    else if (getenv("PROTON_A2NEW") && (instr & 0x3f200c00) == 0x38000000)  /* LDUR/STUR (unscaled 9-bit signed imm) */
+    else if ((instr & 0x3f200c00) == 0x38000000)           /* LDUR/STUR (unscaled 9-bit signed imm) */
     {
         int imm9 = (int)((instr >> 12) & 0x1ff);
         imm9 = (imm9 ^ 0x100) - 0x100;                     /* sign-extend 9 bits */
         addr = (BYTE *)teb + imm9;
     }
-    else if (getenv("PROTON_A2NEW") && (instr & 0x3f200c00) == 0x38200800)  /* LDR/STR (register offset) [x18,Xm{,ext,shift}] */
+    else if ((instr & 0x3f200c00) == 0x38200800)           /* LDR/STR (register offset) [x18,Xm{,ext,shift}] */
     {
         unsigned int Rm = (instr >> 16) & 0x1f, option = (instr >> 13) & 7, S = (instr >> 12) & 1;
         ULONG64 off = (Rm == 31) ? 0 : ((Rm == 18) ? teb : REGn_sig( Rm, context ));
