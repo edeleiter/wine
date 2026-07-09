@@ -1355,12 +1355,19 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
     RESTORE_TEB_REGISTER();
 #ifdef __APPLE__
-    { static int n; if (n++ < 6)   /* BUSDIAG-REMOVE: characterize the alignment fault (atomic vs plain) */
-        ERR( "BUSDIAG pc=%llx instr=%08x fa=%llx lr=%llx x16=%llx x17=%llx x18=%llx\n",
-             (unsigned long long)PC_sig(context), (unsigned)*(ULONG*)PC_sig(context),
-             (unsigned long long)(ULONG_PTR)siginfo->si_addr, (unsigned long long)REGn_sig(30,context),
-             (unsigned long long)REGn_sig(16,context), (unsigned long long)REGn_sig(17,context),
-             (unsigned long long)REGn_sig(18,context) ); }
+    /* proton-mac: macOS delivers PROTECTION faults (access to a PROT_NONE / reserved page — e.g. FEX's
+     * overcommit-reserved LookupCache; also exec on a non-exec page) as SIGBUS, not SIGSEGV as Linux does.
+     * Only a true ALIGNMENT fault (ESR data/instr fault status code 0x21) is a datatype-misalignment; route
+     * everything else through segv_handler's access-violation path so Wine's fault handler and FEX's
+     * overcommit/SEH handler can commit or dispatch it. */
+    if ((get_fault_esr( context ) & 0x3f) != 0x21)
+    {
+        segv_handler( signal, siginfo, sigcontext );
+        return;
+    }
+    { static int n; if (n++ < 6)   /* BUSDIAG-REMOVE */
+        ERR( "BUSDIAG (alignment) pc=%llx instr=%08x fa=%llx\n", (unsigned long long)PC_sig(context),
+             (unsigned)*(ULONG*)PC_sig(context), (unsigned long long)(ULONG_PTR)siginfo->si_addr ); }
 #endif
     setup_exception( sigcontext, &rec );
 }
