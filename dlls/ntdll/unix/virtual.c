@@ -2025,7 +2025,6 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  * mprotect afterwards, so we never re-arm what we just warmed. Only 4-aligned 0xd65f03c0 words are
  * branched to (they decode+execute as `ret` and return to LR regardless of surrounding bytes). The
  * scanned range is exactly what mprotect_range just protected (host-page rounded), so no over-read. */
-void *proton_wledger[16384]; int proton_wledger_n;   /* WLEDGER-REMOVE: independent record of warmed pages */
 
 /* proton-mac: warm a 16KB RX page that has no aligned `ret` to branch to (a dense mid-function page).
  * We can't blr into it (executing a real instruction with x18=0 could fault/corrupt) and can't mprotect
@@ -2081,7 +2080,6 @@ static void warm_exec_range( void *base, size_t size )
             }
         }
         if (!warmed) warm_noret_page( page );    /* no ret to branch to: alias-plant one, then warm */
-        if (proton_wledger_n < 16384) proton_wledger[proton_wledger_n++] = page;   /* WLEDGER-REMOVE */
     }
 }
 
@@ -5312,16 +5310,12 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
                 if (vprot & VPROT_EXEC || force_exec_prot)
                 {
 #ifdef __APPLE__
-                    { static int n; if (n++ < 12) ERR("DUALDIAG execalloc base=%p size=%zx attrs=%x dualmap=%d\n",  /* DUALDIAG-REMOVE */
-                        base, size, attributes, !!(attributes & MEM_EXTENDED_PARAMETER_FEX_DUALMAP)); }
                     if (attributes & MEM_EXTENDED_PARAMETER_FEX_DUALMAP)
                     {
                         /* proton-mac JIT W^X: keep the base RW (drop EXEC — macOS won't honor W+X) and
                          * mach_vm_remap a separate RX alias; FEX executes via the alias (query below). */
-                        void *alias;
                         mprotect_range( base, size, 0, VPROT_EXEC );
-                        alias = create_fex_exec_alias( base, size );
-                        ERR("DUALDIAG created alias base=%p -> %p\n", base, alias);   /* DUALDIAG-REMOVE */
+                        create_fex_exec_alias( base, size );
                     }
                     else
 #endif

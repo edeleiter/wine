@@ -308,48 +308,17 @@ static void save_context( CONTEXT *context, const ucontext_t *sigcontext )
 
 
 #ifdef __APPLE__
-/* proton-mac: macOS zeroes x18 (the TEB register) on every sigreturn, ignoring the
- * mcontext (probe-confirmed). So any code resumed via a handler return runs with a
- * NULL TEB until the next Wine syscall restores x18 -> intermittent TEB-access
- * crashes/deadlocks (e.g. a thread interrupted inside RtlLeaveCriticalSection).
- * We keep the kernel sigreturn (so signal mask + altstack stay correct) but redirect
- * the resume PC to this trampoline, which restores x18 first. The handler stashes a
- * 32-byte block just below the resumed sp: [teb, real_pc, saved_x16, pad]. The
- * trampoline restores x18 and x16, pops the block, and branches to real_pc.
+/* proton-mac: macOS zeroes x18 (the TEB register) on every sigreturn, ignoring the mcontext
+ * (probe-confirmed). So any code resumed via a handler return runs with a NULL TEB until the next
+ * Wine syscall restores x18 -> intermittent TEB-access crashes/deadlocks.
  *
- * INVARIANT — the trampoline SACRIFICES x17 (it holds the branch target). This is only
- * safe where x17 is dead at the resume point, i.e. the SYNCHRONOUS fault-recovery paths
- * in segv_handler (a data abort mid-instruction: x17 is an IP scratch reg, dead there;
- * empirically the recovered fault PCs had no live x17). It is NOT used for ASYNC resumes
- * (restore_context / usr2 NtSetContextThread), which could resume mid-EC-thunk where x17
- * is live — those instead let the plain sigreturn zero x18 and rely on the reactive
- * segv net to heal it at the first [x18,#off] TEB access (a synchronous, x17-dead point).
- * Also assumes Wine PE RX pages are not BTI/GCS-guarded (br to a non-landing-pad target). */
-extern void x18_resume_trampoline(void);
-__ASM_GLOBAL_FUNC( x18_resume_trampoline,
-                   "ldr x18, [x17]\n\t"       /* teb     (stash[0], via the x17 pointer — NOT sp-relative) */
-                   "ldr x17, [x17, #8]\n\t"   /* real pc (stash[1]; sacrifices x17, which is dead here) */
-                   "br x17" )
-
-/* Redirect whatever PC_sig currently points at through x18_resume_trampoline, so the resumed code runs with
- * x18=TEB. Call right before a handler returns to user/PE code. Only for SYNCHRONOUS fault-recovery resumes
- * (see the x17 invariant above).
- *
- * Stash TEB + resume PC in a 16B-aligned scratch just below the interrupted SP and pass its ADDRESS via x17
- * (a caller-saved reg, restored by sigreturn — x18 can't be, macOS zeroes it). The trampoline then loads both
- * X17-relative, so it never does an SP-relative access — which would trip macOS's SCTLR.SA alignment check
- * when the interrupted SP is only 8B-aligned (as happens mid-x64-guest-execution). SP and x16 are left
- * UNTOUCHED: x16 is a live guest-mapped register in FEX's ARM64EC JIT (Arm64Emitter.cpp RA pool) and must be
- * preserved; the original SP is already correct so we don't move it. Layout (offsets 0/8) must match the
- * trampoline's ldr offsets. */
-static void redirect_x18_resume( ucontext_t *sigcontext )
-{
-    ULONG_PTR *stash = (ULONG_PTR *)((SP_sig(sigcontext) - 16) & ~(ULONG_PTR)15);
-    stash[0] = (ULONG_PTR)NtCurrentTeb();     /* trampoline: ldr x18, [x17]     */
-    stash[1] = PC_sig(sigcontext);            /* trampoline: ldr x17, [x17, #8] */
-    REGn_sig(17, sigcontext) = (ULONG_PTR)stash;
-    PC_sig(sigcontext) = (ULONG_PTR)x18_resume_trampoline;
-}
+ * RETIRED APPROACH (do not reintroduce): an earlier fix redirected the resume PC through a
+ * trampoline that reloaded x18 from a stashed TEB, but it SACRIFICED x17 to hold the branch target.
+ * That is unsafe anywhere x17 is live — and x17 is live mid-EC-thunk (it is the EC-dispatch scratch,
+ * held in FEX's CPUArea), so the trampoline corrupted guest execution. Superseded by the
+ * register-transparent recovery below: segv_handler emulates the faulting [x18,#imm] access (or
+ * fixes a near-null derived base) in place and re-executes, carrying NO register through the resume.
+ * x18 itself is re-established at every handler entry via RESTORE_TEB_REGISTER() (pthread TSD). */
 #endif
 
 /***********************************************************************
@@ -1166,16 +1135,6 @@ static inline void restore_teb_register(void)
     __asm__ volatile( "mov x18, %0" :: "r"(pthread_getspecific( teb_key )) : "memory" );
 }
 #define RESTORE_TEB_REGISTER() restore_teb_register()
-int proton_c_usr1, proton_c_usr2, proton_c_trap;   /* SIGCENSUS-REMOVE: async/trap counts (no I/O in handlers) */
-extern void *proton_wledger[]; extern int proton_wledger_n;   /* WLEDGER-REMOVE */
-int proton_cf_warmed, proton_cf_cold;   /* WLEDGER-REMOVE: recovered [x18] faults on warmed vs unwarmed pages */
-static int proton_page_warmed( ULONG64 pc )
-{
-    void *pg = (void *)((ULONG_PTR)pc & ~(ULONG_PTR)0x3fff);   /* 16KB host page */
-    int i;
-    for (i = 0; i < proton_wledger_n; i++) if (proton_wledger[i] == pg) return 1;
-    return 0;
-}
 
 /* proton-mac: emulate a faulting [x18,#imm] integer load/store IN the handler and advance PC,
  * instead of re-executing it on the cold RX page (whose first execution re-zeroes x18 -> the
@@ -1248,9 +1207,9 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
      * instruction faults again -> infinite loop (proven: guest __wine_dbg_header ldr w8,[x18,#0x3000]).
      * Instead EMULATE the faulting [x18,#imm] load/store in-handler and advance PC by 4, so we never
      * re-execute on the cold page; the page then warms naturally when the next non-x18 instruction
-     * retires. Resume still goes through redirect_x18_resume so x18=TEB is delivered past the sigreturn
-     * (which itself re-zeroes x18). Forms we don't emulate fall back to the plain redirect (unchanged).
-     * x17 is an IP scratch reg (dead at these boundaries); the trampoline's x17 sacrifice is safe. */
+     * retires. The plain sigreturn re-zeroes x18, but that is fine: no register is carried across the
+     * resume, so any later TEB access simply re-faults and re-recovers here. Forms we don't emulate
+     * are reported and fall through to the near-null derived-base fix or the normal fault path. */
     if (REGn_sig( 18, context ) == 0 &&              /* TEB reg clobbered to 0 */
         (esr & 0xf0000000) != 0x80000000)            /* data abort, not an execute/fetch abort */
     {
@@ -1280,22 +1239,6 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             return;                            /* re-execute at the same PC with the corrected base */
         }
     }
-    {   /* SIGCENSUS-REMOVE: dump async/trap counts at the FIRST un-recovered near-null fault (the crash).
-         * Answers: did a sigreturn (usr1/usr2/trap) precede the x18=0 crash? */
-        static int dumped;
-        DWORD64 fa = (DWORD64)siginfo->si_addr;
-        if (!dumped && (esr & 0xf0000000) != 0x80000000 && fa < 0x10000)
-        {
-            const ULONG *sp = (const ULONG *)(PC_sig(context) & ~(ULONG_PTR)0x3fff);   /* WLEDGER-REMOVE */
-            const ULONG *se = sp + 0x1000; int hasret = 0;                              /* scan crash 16KB page */
-            for (; sp < se; sp++) if (*sp == 0xd65f03c0) { hasret = 1; break; }
-            dumped = 1;
-            ERR( "SIGCENSUS-CRASH pc=%llx fa=%llx x18=%llx crashpg_warmed=%d crashpg_hasret=%d | usr1=%d usr2=%d trap=%d | recovered[x18] on warmed=%d cold=%d | ledger_n=%d\n",
-                 (unsigned long long)PC_sig(context), (unsigned long long)fa,
-                 (unsigned long long)REGn_sig(18,context), proton_page_warmed( PC_sig(context) ), hasret,
-                 proton_c_usr1, proton_c_usr2, proton_c_trap, proton_cf_warmed, proton_cf_cold, proton_wledger_n );
-        }
-    }
 #endif
     if (!virtual_handle_fault( &rec, (void *)SP_sig(context) ))
     {
@@ -1319,12 +1262,6 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *context = sigcontext;
 
     RESTORE_TEB_REGISTER();
-    { static int n; if (n++ < 4)   /* ILLDIAG-REMOVE: capture the FEX ForcedAssert caller + args */
-        ERR( "ILLDIAG pc=%llx instr=%08x lr=%llx x0=%llx x1=%llx x2=%llx x8=%llx\n",
-             (unsigned long long)PC_sig(context), (unsigned)*(ULONG*)PC_sig(context),
-             (unsigned long long)REGn_sig(30,context), (unsigned long long)REGn_sig(0,context),
-             (unsigned long long)REGn_sig(1,context), (unsigned long long)REGn_sig(2,context),
-             (unsigned long long)REGn_sig(8,context) ); }
     if (!(PSTATE_sig( context ) & 0x10) && /* AArch64 (not WoW) */
         !(PC_sig( context ) & 3))
     {
@@ -1365,9 +1302,6 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         segv_handler( signal, siginfo, sigcontext );
         return;
     }
-    { static int n; if (n++ < 6)   /* BUSDIAG-REMOVE */
-        ERR( "BUSDIAG (alignment) pc=%llx instr=%08x fa=%llx\n", (unsigned long long)PC_sig(context),
-             (unsigned)*(ULONG*)PC_sig(context), (unsigned long long)(ULONG_PTR)siginfo->si_addr ); }
 #endif
     setup_exception( sigcontext, &rec );
 }
@@ -1385,9 +1319,6 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     CONTEXT ctx;
 
     RESTORE_TEB_REGISTER();
-#ifdef __APPLE__
-    proton_c_trap++;   /* SIGCENSUS-REMOVE */
-#endif
     rec.ExceptionAddress = (void *)PC_sig(context);
     save_context( &ctx, sigcontext );
 
@@ -1551,9 +1482,6 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     CONTEXT context;
 
     RESTORE_TEB_REGISTER();
-#ifdef __APPLE__
-    proton_c_usr1++;   /* SIGCENSUS-REMOVE */
-#endif
     if (is_arm64ec_suspend_doorbell_valid() &&
         (NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation || NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback))
     {
@@ -1591,9 +1519,6 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     DWORD i;
 
     RESTORE_TEB_REGISTER();
-#ifdef __APPLE__
-    proton_c_usr2++;   /* SIGCENSUS-REMOVE */
-#endif
     frame = get_syscall_frame();
     if (!is_inside_syscall( SP_sig(context) )) return;
 
@@ -1619,10 +1544,9 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     context->uc_mcontext->__ns.__fpsr = frame->fpsr;
     memcpy( context->uc_mcontext->__ns.__v, frame->v, sizeof(frame->v) );
 #endif
-    /* proton-mac: ASYNC resume (NtSetContextThread) — deliberately NOT redirected through
-     * x18_resume_trampoline (it would clobber x17, which can be live mid-EC-thunk here).
-     * macOS zeroes x18 on the sigreturn; the reactive segv net restores it at the first
-     * [x18,#off] TEB access (a synchronous, x17-dead point). See trampoline invariant. */
+    /* proton-mac: ASYNC resume (NtSetContextThread). macOS zeroes x18 on the sigreturn; the reactive
+     * segv net emulates-and-recovers it at the first [x18,#off] TEB access, carrying no register across
+     * the resume — safe even mid-EC-thunk where x17 is live. See the retired-trampoline note up top. */
 }
 
 
@@ -1679,7 +1603,7 @@ static void sys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     case 233: REGn_sig( 0, context ) = 0; break;            /* madvise(THP): no-op success (macOS has no THP) */
     case 172: REGn_sig( 0, context ) = getpid(); break;     /* getpid */
     default:
-        ERR( "SYSDIAG unhandled raw Linux syscall %llu pc=%llx lr=%llx\n",
+        ERR( "proton-mac: unhandled raw Linux syscall %llu pc=%llx lr=%llx\n",
              (unsigned long long)nr, (unsigned long long)PC_sig(context), (unsigned long long)REGn_sig(30,context) );
         _exit( 139 );
     }
@@ -1725,7 +1649,8 @@ void signal_init_process(void)
     sig_act.sa_sigaction = bus_handler;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
 #ifdef __APPLE__
-    sig_act.sa_sigaction = sys_handler;   /* SYSDIAG-REMOVE */
+    /* proton-mac: FEX issues raw Linux svc syscalls; macOS rejects them with SIGSYS. Emulate the few it uses. */
+    sig_act.sa_sigaction = sys_handler;
     if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
 #endif
     return;
