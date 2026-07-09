@@ -1140,17 +1140,56 @@ static inline void restore_teb_register(void)
  * instead of re-executing it on the cold RX page (whose first execution re-zeroes x18 -> the
  * same instruction data-faults again -> infinite loop; see the segv_handler x18 block). This
  * never executes a page-resident byte, so there is no risk of branching into misidentified data.
- * Covers the integer (V=0) LDR/STR family with base Rn==x18 in THREE addressing forms that
+ * Covers the integer (V=0) LDR/STR family with base Rn==x18 in these addressing forms that
  * compilers emit for TEB access: unsigned-immediate (0x39...), unscaled-immediate LDUR/STUR
- * (0x38...,bit21=0), and register-offset [x18,Xm{,ext}] (0x38...,bit21=1). Returns FALSE for
- * anything else (LDP/STP pair, SIMD, writeback) so the caller reports it. x18 is already restored
- * to TEB at handler entry, so NtCurrentTeb() is valid; the effective base is always TEB (== the
- * value x18 should hold). Decoder verified against ARM ARM C4.1. */
+ * (0x38...,bit21=0), register-offset [x18,Xm{,ext}] (0x38...,bit21=1), and the LDP/STP integer
+ * PAIR offset form (0x29/0xa9...) — optimized win32u hot paths (e.g. the message pump) load
+ * adjacent TEB fields with LDP. Returns FALSE for SIMD/FP and writeback (pre/post-index) forms so
+ * the caller reports them. x18 is already restored to TEB at handler entry, so NtCurrentTeb() is
+ * valid; the effective base is always TEB (== the value x18 should hold). Decoder verified against
+ * ARM ARM C4.1. */
 static BOOL emulate_teb_load_store( ucontext_t *context, ULONG instr )
 {
     unsigned int size = instr >> 30, opc = (instr >> 22) & 3, Rt = instr & 0x1f, width;
     ULONG64 teb = (ULONG64)(ULONG_PTR)pthread_getspecific( teb_key );
     BYTE *addr;
+
+    /* Load/store PAIR (offset, integer V=0): `opc 101 0 010 L imm7 Rt2 Rn Rt`, base Rn==x18 (caller-
+     * guaranteed). opc: 00=32-bit, 10=64-bit, 01=LDPSW(load, sign-extend). imm7 signed, scaled by the
+     * per-register datasize. Non-writeback only; pre/post-index (0x28/0xa8 bit24=0, 0x29c/… bit23=1)
+     * are not matched -> declined. */
+    if ((instr & 0x3f800000) == 0x29000000)
+    {
+        unsigned int ppc = instr >> 30, L = (instr >> 22) & 1;
+        unsigned int Rt2 = (instr >> 10) & 0x1f, Rt1 = instr & 0x1f, ds;
+        int imm7 = (int)((instr >> 15) & 0x7f);
+        if (ppc == 3) return FALSE;                        /* reserved */
+        if (ppc == 1 && !L) return FALSE;                  /* STGP (store alloc-tag pair) — decline */
+        imm7 = (imm7 ^ 0x40) - 0x40;                       /* sign-extend 7 bits */
+        ds = (ppc == 2) ? 8 : 4;                           /* 64-bit vs 32-bit per-register datasize */
+        addr = (BYTE *)teb + (ULONG_PTR)((LONG_PTR)imm7 * (LONG_PTR)ds);
+        if (L)                                             /* LDP / LDPSW */
+        {
+            ULONG64 v1 = 0, v2 = 0;
+            memcpy( &v1, addr, ds );
+            memcpy( &v2, addr + ds, ds );
+            if (ppc == 1)                                  /* LDPSW: sign-extend each 32-bit word to 64 */
+            {
+                v1 = (ULONG64)(LONG64)(int)(ULONG)v1;
+                v2 = (ULONG64)(LONG64)(int)(ULONG)v2;
+            }
+            if (Rt1 != 31) REGn_sig( Rt1, context ) = v1;
+            if (Rt2 != 31) REGn_sig( Rt2, context ) = v2;
+        }
+        else                                               /* STP */
+        {
+            ULONG64 v1 = (Rt1 == 31) ? 0 : REGn_sig( Rt1, context );
+            ULONG64 v2 = (Rt2 == 31) ? 0 : REGn_sig( Rt2, context );
+            memcpy( addr, &v1, ds );
+            memcpy( addr + ds, &v2, ds );
+        }
+        return TRUE;
+    }
 
     if ((instr & 0x3f000000) == 0x39000000)                /* LDR/STR (unsigned immediate) */
     {
