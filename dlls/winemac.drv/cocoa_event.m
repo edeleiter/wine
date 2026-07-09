@@ -231,9 +231,15 @@ static const OSType WineHotKeySignature = 'Wine';
         else
             [events addObject:event];
 
-        [eventsLock unlock];
-
+        /* proton-mac: signal INSIDE eventsLock (was after the unlock). A pipe byte must never be in
+         * flight without its event already visible to getEventMatchingMask's scan; otherwise the guest
+         * can drain-and-scan between the unlock and the write, see an empty array (count=0) yet find the
+         * fd still readable -> macdrv_ProcessEvents returns drained=FALSE forever -> QS_DRIVER never
+         * clears -> the message pump wedges at 100% CPU (U6-B). write() is non-blocking (drops on EAGAIN)
+         * so holding the lock across it cannot deadlock the reader. */
         [self signalEventAvailable];
+
+        [eventsLock unlock];
     }
 
     - (void) postEvent:(macdrv_event*)inEvent
@@ -250,6 +256,12 @@ static const OSType WineHotKeySignature = 'Wine';
         NSUInteger index;
         MacDrvEvent* ret = nil;
 
+        /* proton-mac: drain the signal pipe + scan the events array ATOMICALLY under eventsLock (the
+         * drain was previously done before taking the lock). Paired with postEventObject signaling under
+         * the lock, this makes "pipe readable" ⟺ "a matchable event is present" — closing the post-then-
+         * scan race that left the fd readable with count=0 and wedged the pump (U6-B). */
+        [eventsLock lock];
+
         /* Clear the pipe which signals there are pending events. */
         do
         {
@@ -257,14 +269,13 @@ static const OSType WineHotKeySignature = 'Wine';
         } while (rc > 0 || (rc < 0 && errno == EINTR));
         if (rc == 0 || (rc < 0 && errno != EAGAIN))
         {
+            [eventsLock unlock];
             if (rc == 0)
                 ERR(@"%@: event queue signaling pipe unexpectedly closed\n", self);
             else
                 ERR(@"%@: got error reading from event queue signaling pipe: %s\n", self, strerror(errno));
             return nil;
         }
-
-        [eventsLock lock];
 
         index = 0;
         while (index < [events count])
