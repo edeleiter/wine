@@ -1136,43 +1136,68 @@ static inline void restore_teb_register(void)
 }
 #define RESTORE_TEB_REGISTER() restore_teb_register()
 
-/* proton-mac: emulate a faulting [x18,#imm] integer load/store IN the handler and advance PC,
+/* proton-mac: emulate a faulting x18-based integer load/store IN the handler and advance PC,
  * instead of re-executing it on the cold RX page (whose first execution re-zeroes x18 -> the
  * same instruction data-faults again -> infinite loop; see the segv_handler x18 block). This
  * never executes a page-resident byte, so there is no risk of branching into misidentified data.
- * Handles only the load/store-register-unsigned-immediate family (the forms observed as TEB
- * first-touch faults); returns FALSE for anything else so the caller falls back to the plain
- * trampoline redirect (unchanged behaviour). x18 is already restored to TEB at handler entry,
- * so NtCurrentTeb() is valid. Decoder verified against ARM ARM C4.1 and probe emul_advance.c. */
+ * Covers the integer (V=0) LDR/STR family with base Rn==x18 in THREE addressing forms that
+ * compilers emit for TEB access: unsigned-immediate (0x39...), unscaled-immediate LDUR/STUR
+ * (0x38...,bit21=0), and register-offset [x18,Xm{,ext}] (0x38...,bit21=1). Returns FALSE for
+ * anything else (LDP/STP pair, SIMD, writeback) so the caller reports it. x18 is already restored
+ * to TEB at handler entry, so NtCurrentTeb() is valid; the effective base is always TEB (== the
+ * value x18 should hold). Decoder verified against ARM ARM C4.1. */
 static BOOL emulate_teb_load_store( ucontext_t *context, ULONG instr )
 {
-    unsigned int size = instr >> 30, opc = (instr >> 22) & 3;
-    unsigned int imm12 = (instr >> 10) & 0xfff, Rt = instr & 0x1f, width;
+    unsigned int size = instr >> 30, opc = (instr >> 22) & 3, Rt = instr & 0x1f, width;
+    ULONG64 teb = (ULONG64)(ULONG_PTR)pthread_getspecific( teb_key );
     BYTE *addr;
 
-    if ((instr & 0x3f000000) != 0x39000000) return FALSE;  /* not LDR/STR unsigned-imm (V=0) */
-    if (size == 3 && opc == 2) return TRUE;                 /* PRFM: architecturally inert; just advance */
-    if (opc == 3 && size >= 2) return FALSE;                /* reserved encodings */
-    width = 1u << size;
-    addr = (BYTE *)NtCurrentTeb() + ((ULONG_PTR)imm12 << size);
+    if ((instr & 0x3f000000) == 0x39000000)                /* LDR/STR (unsigned immediate) */
+    {
+        unsigned int imm12 = (instr >> 10) & 0xfff;
+        addr = (BYTE *)teb + ((ULONG_PTR)imm12 << size);
+    }
+    else if (getenv("PROTON_A2NEW") && (instr & 0x3f200c00) == 0x38000000)  /* LDUR/STUR (unscaled 9-bit signed imm) */
+    {
+        int imm9 = (int)((instr >> 12) & 0x1ff);
+        imm9 = (imm9 ^ 0x100) - 0x100;                     /* sign-extend 9 bits */
+        addr = (BYTE *)teb + imm9;
+    }
+    else if (getenv("PROTON_A2NEW") && (instr & 0x3f200c00) == 0x38200800)  /* LDR/STR (register offset) [x18,Xm{,ext,shift}] */
+    {
+        unsigned int Rm = (instr >> 16) & 0x1f, option = (instr >> 13) & 7, S = (instr >> 12) & 1;
+        ULONG64 off = (Rm == 31) ? 0 : ((Rm == 18) ? teb : REGn_sig( Rm, context ));
+        if (!(option & 1))                                 /* UXTW/SXTW: 32-bit index register */
+        {
+            off &= 0xffffffffull;
+            if (option & 4) off = (ULONG64)(LONG64)(int)(ULONG)off;   /* SXTW: sign-extend to 64 */
+        }
+        if (S) off <<= size;                               /* scaled by access size when S==1 */
+        addr = (BYTE *)teb + off;
+    }
+    else return FALSE;                                     /* unhandled addressing form */
 
-    if (opc == 0)                                           /* STR (Rt==31 -> stores zero) */
+    if (size == 3 && opc == 2) return TRUE;                /* PRFM: architecturally inert; just advance */
+    if (opc == 3 && size >= 2) return FALSE;               /* reserved encodings */
+    width = 1u << size;
+
+    if (opc == 0)                                          /* STR (Rt==31 -> stores zero) */
     {
         ULONG64 v = (Rt == 31) ? 0 : REGn_sig( Rt, context );
         memcpy( addr, &v, width );
     }
-    else                                                    /* LDR / LDRS* */
+    else                                                   /* LDR / LDRS* */
     {
         ULONG64 raw = 0, val;
-        memcpy( &raw, addr, width );                        /* width bytes, upper zero-filled */
-        if (opc == 1) val = raw;                            /* LDR: zero-extend (32-bit dest already 0-upper) */
+        memcpy( &raw, addr, width );                       /* width bytes, upper zero-filled */
+        if (opc == 1) val = raw;                           /* LDR: zero-extend (32-bit dest already 0-upper) */
         else
         {
-            ULONG64 sbit = 1ull << (width * 8 - 1);         /* sign-extend width bytes to 64 */
+            ULONG64 sbit = 1ull << (width * 8 - 1);        /* sign-extend width bytes to 64 */
             val = (raw ^ sbit) - sbit;
-            if (opc == 3) val = (ULONG)val;                 /* LDRS*->32: then zero-extend to 64 */
+            if (opc == 3) val = (ULONG)val;                /* LDRS*->32: then zero-extend to 64 */
         }
-        if (Rt != 31) REGn_sig( Rt, context ) = val;        /* Rt==31 -> xzr, discard */
+        if (Rt != 31) REGn_sig( Rt, context ) = val;       /* Rt==31 -> xzr, discard */
     }
     return TRUE;
 }
@@ -1223,10 +1248,18 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
              * is live (FEX EC-dispatch holds CPUArea in x17, e.g. `enter_jit`). Emulating (not re-executing)
              * also avoids the cold-page re-fault loop. */
             if (emulate_teb_load_store( context, instr ))
+            {
                 PC_sig( context ) += 4;
-            else
-                ERR( "A2: unhandled [x18] form %08x at pc=%llx\n", (unsigned)instr, (unsigned long long)PC_sig(context) );
-            return;
+                return;
+            }
+            /* Unhandled x18-base form: do NOT return (re-executing would infinite-loop, since x18
+             * is re-zeroed on sigreturn). Report once and fall through to the normal fault path so
+             * it surfaces as a proper exception rather than a spin. */
+            {
+                static int warned;
+                if (!warned++) ERR( "A2: unhandled [x18] form %08x at pc=%llx (falling through)\n",
+                                    (unsigned)instr, (unsigned long long)PC_sig(context) );
+            }
         }
         else if ((ULONG_PTR)siginfo->si_addr < 0x10000)
         {   /* Derived-base [xN] (FEX materializes TEB into a scratch: `add x8,x18,x0; str [x8,#imm]`, so the
