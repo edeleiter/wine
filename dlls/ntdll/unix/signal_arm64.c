@@ -327,23 +327,27 @@ static void save_context( CONTEXT *context, const ucontext_t *sigcontext )
  * Also assumes Wine PE RX pages are not BTI/GCS-guarded (br to a non-landing-pad target). */
 extern void x18_resume_trampoline(void);
 __ASM_GLOBAL_FUNC( x18_resume_trampoline,
-                   "ldr x18, [sp]\n\t"        /* teb            (stash[0]) */
-                   "ldr x17, [sp, #8]\n\t"    /* real pc        (stash[1]; sacrifices x17) */
-                   "ldr x16, [sp, #16]\n\t"   /* restore x16    (stash[2]) */
-                   "add sp, sp, #32\n\t"
+                   "ldr x18, [x17]\n\t"       /* teb     (stash[0], via the x17 pointer — NOT sp-relative) */
+                   "ldr x17, [x17, #8]\n\t"   /* real pc (stash[1]; sacrifices x17, which is dead here) */
                    "br x17" )
 
-/* Redirect whatever PC_sig currently points at through x18_resume_trampoline, so the
- * resumed code runs with x18=TEB. Call right before a handler returns to user/PE code.
- * Only for SYNCHRONOUS fault-recovery resumes (see the x17 invariant above). The 32-byte
- * stash layout below (offsets 0/8/16) must match the trampoline's ldr offsets. */
+/* Redirect whatever PC_sig currently points at through x18_resume_trampoline, so the resumed code runs with
+ * x18=TEB. Call right before a handler returns to user/PE code. Only for SYNCHRONOUS fault-recovery resumes
+ * (see the x17 invariant above).
+ *
+ * Stash TEB + resume PC in a 16B-aligned scratch just below the interrupted SP and pass its ADDRESS via x17
+ * (a caller-saved reg, restored by sigreturn — x18 can't be, macOS zeroes it). The trampoline then loads both
+ * X17-relative, so it never does an SP-relative access — which would trip macOS's SCTLR.SA alignment check
+ * when the interrupted SP is only 8B-aligned (as happens mid-x64-guest-execution). SP and x16 are left
+ * UNTOUCHED: x16 is a live guest-mapped register in FEX's ARM64EC JIT (Arm64Emitter.cpp RA pool) and must be
+ * preserved; the original SP is already correct so we don't move it. Layout (offsets 0/8) must match the
+ * trampoline's ldr offsets. */
 static void redirect_x18_resume( ucontext_t *sigcontext )
 {
-    ULONG_PTR *sp = (ULONG_PTR *)(SP_sig(sigcontext) - 32);
-    sp[0] = (ULONG_PTR)NtCurrentTeb();       /* trampoline: ldr x18, [sp]      */
-    sp[1] = PC_sig(sigcontext);              /* trampoline: ldr x17, [sp, #8]  */
-    sp[2] = REGn_sig(16, sigcontext);        /* trampoline: ldr x16, [sp, #16] */
-    SP_sig(sigcontext) = (ULONG_PTR)sp;
+    ULONG_PTR *stash = (ULONG_PTR *)((SP_sig(sigcontext) - 16) & ~(ULONG_PTR)15);
+    stash[0] = (ULONG_PTR)NtCurrentTeb();     /* trampoline: ldr x18, [x17]     */
+    stash[1] = PC_sig(sigcontext);            /* trampoline: ldr x17, [x17, #8] */
+    REGn_sig(17, sigcontext) = (ULONG_PTR)stash;
     PC_sig(sigcontext) = (ULONG_PTR)x18_resume_trampoline;
 }
 #endif
@@ -1254,10 +1258,14 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         if (((instr >> 5) & 0x1f) == 18)             /* AArch64 load/store base register Rn (bits[9:5]) == x18 */
         {
             if (proton_page_warmed( PC_sig(context) )) proton_cf_warmed++; else proton_cf_cold++;  /* WLEDGER-REMOVE */
-            if (emulate_teb_load_store( context, instr ))
-                PC_sig( context ) += 4;              /* emulated: skip past the faulting instruction */
-            /* else: unhandled form -> resume at the same PC (best-effort, as before) */
-            redirect_x18_resume( context );          /* trampoline reloads x18=TEB, resumes at PC(+4) */
+            /* proton-mac: RE-EXECUTE with x18=TEB delivered by the trampoline (matches the [xN] path below),
+             * instead of emulating + PC+=4. Emulation writes the destination register in-handler, but the
+             * trampoline sacrifices x17 — so when the destination IS x17 (FEX's `enter_jit`:
+             * `ldr x17,[x18,#0x1788]`) the emulated value was destroyed and the next insn stored through a
+             * bad x17. Re-executing lets the instruction reload its own destination from x18=TEB, making the
+             * x17 sacrifice harmless. (The old cold-page re-fault loop this avoided no longer bites here:
+             * these pages are warm by guest-transition time.) */
+            redirect_x18_resume( context );
             return;
         }
         else if ((ULONG_PTR)siginfo->si_addr < 0x10000)
@@ -1346,8 +1354,15 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_DATATYPE_MISALIGNMENT };
+    ucontext_t *context = sigcontext;
 
     RESTORE_TEB_REGISTER();
+#ifdef __APPLE__
+    { static int n; if (n++ < 6)   /* BUSDIAG-REMOVE: characterize the alignment fault (atomic vs plain) */
+        ERR( "BUSDIAG pc=%llx instr=%08x fa=%llx lr=%llx\n",
+             (unsigned long long)PC_sig(context), (unsigned)*(ULONG*)PC_sig(context),
+             (unsigned long long)(ULONG_PTR)siginfo->si_addr, (unsigned long long)REGn_sig(30,context) ); }
+#endif
     setup_exception( sigcontext, &rec );
 }
 
@@ -1638,6 +1653,34 @@ void signal_free_thread( TEB *teb )
 {
 }
 
+#ifdef __APPLE__
+/* proton-mac: FEX's "Illegal" fallback path (FEXUnixLib.cpp, used when Wine's unixlib dispatcher isn't
+ * available) issues RAW LINUX syscalls via `svc` with the Linux number in x8. These exist under
+ * Hangover-on-Linux but macOS rejects them with SIGSYS (which Wine otherwise doesn't handle -> silent
+ * exit 140). They are non-load-bearing host niceties, so emulate them as no-ops in the substrate and
+ * resume past the `svc`. (x18 is zeroed by the sigreturn; the reactive net restores it at the next TEB
+ * access, as with the other async paths.) */
+static void sys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *context = sigcontext;
+    ULONG64 nr;
+
+    RESTORE_TEB_REGISTER();
+    nr = REGn_sig( 8, context );          /* FEX uses the Linux svc ABI: syscall number in x8 */
+    switch (nr)
+    {
+    case 167: REGn_sig( 0, context ) = (ULONG64)-1; break;  /* prctl(PR_SET_VMA_ANON_NAME): fail -> FEX stops retrying */
+    case 233: REGn_sig( 0, context ) = 0; break;            /* madvise(THP): no-op success (macOS has no THP) */
+    case 172: REGn_sig( 0, context ) = getpid(); break;     /* getpid */
+    default:
+        ERR( "SYSDIAG unhandled raw Linux syscall %llu pc=%llx lr=%llx\n",
+             (unsigned long long)nr, (unsigned long long)PC_sig(context), (unsigned long long)REGn_sig(30,context) );
+        _exit( 139 );
+    }
+    /* macOS delivers SIGSYS with PC already past the rejected `svc` (at the following instruction), so do
+     * NOT advance it further — just return x0 and resume. */
+}
+#endif
 
 /**********************************************************************
  *		signal_init_process
@@ -1675,6 +1718,10 @@ void signal_init_process(void)
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
     sig_act.sa_sigaction = bus_handler;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
+#ifdef __APPLE__
+    sig_act.sa_sigaction = sys_handler;   /* SYSDIAG-REMOVE */
+    if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
+#endif
     return;
 
  error:

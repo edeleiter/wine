@@ -2023,6 +2023,93 @@ static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs
     return regidx;
 }
 
+#elif defined(__APPLE__)
+
+/* proton-mac: macOS doesn't expose the raw AArch64 ID registers (mrs of ID_AA64* traps from EL0, and there's
+ * no sysfs). It DOES expose per-feature booleans via sysctl `hw.optional.arm.FEAT_*`. Synthesize the ID
+ * registers CONSERVATIVELY from those: set an ISA field ONLY when its sysctl is true. Under-claiming is safe
+ * (FEX just takes a slower host path); over-claiming would make FEX emit a host instruction that isn't there.
+ * Consumers: Wine publishes these as the `CP %04X` values under CentralProcessor\N (wineboot.c), and FEX's
+ * CPUFeaturesFromRegistry reads exactly CP 4030/4020/4021/4031/4038/403A/4024/4039/4032/5801/4000. */
+static BOOL arm_feat( const char *name )
+{
+    int val = 0;
+    size_t sz = sizeof(val);
+    return !sysctlbyname( name, &val, &sz, NULL, 0 ) && val;
+}
+
+static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs,
+                                     WORD logical_thread_id )
+{
+    UINT64 isar0 = 0, isar1 = 0, isar2 = 0, pfr0, mmfr1 = 0, ctr = 0;
+    int linesize = 64, log2w = 0, w;
+    size_t sz = sizeof(linesize);
+    DWORD i = 0;
+
+    /* MIDR_EL1: Apple implementer ('A'=0x61), ARMv8 architecture (0xf). A generic Apple identity so FEX
+     * applies no Cortex-specific errata; exact part/revision isn't load-bearing for feature detection. */
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4000, 0x610f0000 };
+
+    /* ID_AA64ISAR0_EL1 (0x4030) — 4-bit fields at 4*n. */
+    if      (arm_feat("hw.optional.arm.FEAT_PMULL"))  isar0 |= 2ull << 4;    /* AES: 1=AES, 2=+PMULL */
+    else if (arm_feat("hw.optional.arm.FEAT_AES"))    isar0 |= 1ull << 4;
+    if      (arm_feat("hw.optional.arm.FEAT_SHA1"))   isar0 |= 1ull << 8;
+    if      (arm_feat("hw.optional.arm.FEAT_SHA512")) isar0 |= 2ull << 12;   /* SHA2: 1=SHA256, 2=+SHA512 */
+    else if (arm_feat("hw.optional.arm.FEAT_SHA256")) isar0 |= 1ull << 12;
+    if      (arm_feat("hw.optional.arm.FEAT_CRC32"))  isar0 |= 1ull << 16;
+    if      (arm_feat("hw.optional.arm.FEAT_LSE"))    isar0 |= 2ull << 20;   /* Atomic: 2=LSE */
+    if      (arm_feat("hw.optional.arm.FEAT_RDM"))    isar0 |= 1ull << 28;
+    if      (arm_feat("hw.optional.arm.FEAT_SHA3"))   isar0 |= 1ull << 32;
+    if      (arm_feat("hw.optional.arm.FEAT_DotProd"))isar0 |= 1ull << 44;
+    if      (arm_feat("hw.optional.arm.FEAT_FHM"))    isar0 |= 1ull << 48;
+    if      (arm_feat("hw.optional.arm.FEAT_FlagM2")) isar0 |= 2ull << 52;   /* TS: 1=FlagM, 2=+FlagM2 */
+    else if (arm_feat("hw.optional.arm.FEAT_FlagM"))  isar0 |= 1ull << 52;
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4030, isar0 };
+
+    /* ID_AA64ISAR1_EL1 (0x4031) */
+    if      (arm_feat("hw.optional.arm.FEAT_DPB2"))   isar1 |= 2ull << 0;    /* DPB: 1=DPB, 2=+DPB2 */
+    else if (arm_feat("hw.optional.arm.FEAT_DPB"))    isar1 |= 1ull << 0;
+    if      (arm_feat("hw.optional.arm.FEAT_JSCVT"))  isar1 |= 1ull << 12;
+    if      (arm_feat("hw.optional.arm.FEAT_FCMA"))   isar1 |= 1ull << 16;
+    if      (arm_feat("hw.optional.arm.FEAT_LRCPC2")) isar1 |= 2ull << 20;   /* LRCPC: 1=LRCPC, 2=+LRCPC2 */
+    else if (arm_feat("hw.optional.arm.FEAT_LRCPC"))  isar1 |= 1ull << 20;
+    if      (arm_feat("hw.optional.arm.FEAT_FRINTTS"))isar1 |= 1ull << 32;
+    if      (arm_feat("hw.optional.arm.FEAT_SB"))     isar1 |= 1ull << 36;
+    if      (arm_feat("hw.optional.arm.FEAT_EBF16"))  isar1 |= 2ull << 44;   /* BF16: 1=BF16, 2=+EBF16 */
+    else if (arm_feat("hw.optional.arm.FEAT_BF16"))   isar1 |= 1ull << 44;
+    if      (arm_feat("hw.optional.arm.FEAT_I8MM"))   isar1 |= 1ull << 52;
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4031, isar1 };
+
+    /* ID_AA64ISAR2_EL1 (0x4032) */
+    if      (arm_feat("hw.optional.arm.FEAT_WFxT"))   isar2 |= 1ull << 0;
+    if      (arm_feat("hw.optional.arm.FEAT_RPRES"))  isar2 |= 1ull << 4;
+    if      (arm_feat("hw.optional.arm.FEAT_HBC"))    isar2 |= 1ull << 20;
+    if      (arm_feat("hw.optional.arm.FEAT_CSSC"))   isar2 |= 1ull << 52;
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4032, isar2 };
+
+    /* ID_AA64PFR0_EL1 (0x4020): EL0/EL1 AArch64; FP + AdvSIMD present (field != 0xf), +FP16 variant if any. */
+    pfr0 = 0x11;   /* EL0[3:0]=1, EL1[7:4]=1 */
+    if (arm_feat("hw.optional.arm.FEAT_FP16")) pfr0 |= (1ull << 16) | (1ull << 20);   /* FP/AdvSIMD = FP16 */
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4020, pfr0 };
+
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4021, 0 };   /* PFR1 */
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4024, 0 };   /* ZFR0 (SVE force-disabled by FEX) */
+
+    /* ID_AA64MMFR0/1/2 — only AFP (MMFR1) is x86-relevant and sysctl-confirmable. */
+    if (arm_feat("hw.optional.arm.FEAT_AFP")) mmfr1 |= 1ull << 44;
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4038, 0 };
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x4039, mmfr1 };
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x403a, 0 };
+
+    /* CTR_EL0 (0x5801): I/D min line + CWG = log2(cacheline/4 words); L1Ip=PIPT(0b11); ERG=4. */
+    sysctlbyname( "hw.cachelinesize", &linesize, &sz, NULL, 0 );
+    for (w = linesize / 4; w > 1; w >>= 1) log2w++;
+    ctr = (UINT64)log2w | ((UINT64)log2w << 16) | ((UINT64)log2w << 24) | (3ull << 14) | (4ull << 20);
+    regs[i++] = (struct smbios_wine_id_reg_value_arm64){ 0x5801, ctr };
+
+    return i;
+}
+
 #else
 
 static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs,
