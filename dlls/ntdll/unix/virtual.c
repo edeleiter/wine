@@ -2084,6 +2084,47 @@ static void warm_exec_range( void *base, size_t size )
         if (proton_wledger_n < 16384) proton_wledger[proton_wledger_n++] = page;   /* WLEDGER-REMOVE */
     }
 }
+
+/* proton-mac JIT W^X: macOS forbids single-VA anon RWX even with the JIT entitlements. For an opt-in
+ * (FEX-dualmap) executable allocation we keep the base mapping RW and mach_vm_remap a SEPARATE RX alias of
+ * the same physical pages: FEX writes its JIT via the RW base and executes via the RX alias (each VA is W or
+ * X, never both). base->alias is recorded so NtQueryVirtualMemory(MemoryFexExecAlias) can hand FEX the exec
+ * VA. Same primitive as warm_noret_page's alias, applied to a whole anon region. */
+#define MEM_EXTENDED_PARAMETER_FEX_DUALMAP 0x80000000
+
+static struct { void *base; void *alias; size_t size; } fex_exec_aliases[1024];
+static unsigned fex_exec_alias_count;
+
+static void *create_fex_exec_alias( void *base, size_t size )
+{
+    mach_vm_address_t alias = 0;
+    vm_prot_t cur = 0, max = 0;
+
+    if (mach_vm_remap( mach_task_self(), &alias, size, 0, VM_FLAGS_ANYWHERE,
+                       mach_task_self(), (mach_vm_address_t)(ULONG_PTR)base, FALSE,
+                       &cur, &max, VM_INHERIT_NONE )) return NULL;
+    if (mach_vm_protect( mach_task_self(), alias, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE ))
+    {
+        mach_vm_deallocate( mach_task_self(), alias, size );
+        return NULL;
+    }
+    if (fex_exec_alias_count < 1024)
+    {
+        fex_exec_aliases[fex_exec_alias_count].base  = base;
+        fex_exec_aliases[fex_exec_alias_count].alias = (void *)(ULONG_PTR)alias;
+        fex_exec_aliases[fex_exec_alias_count].size  = size;
+        fex_exec_alias_count++;
+    }
+    return (void *)(ULONG_PTR)alias;
+}
+
+static void *find_fex_exec_alias( const void *base )
+{
+    unsigned i;
+    for (i = 0; i < fex_exec_alias_count; i++)
+        if (fex_exec_aliases[i].base == base) return fex_exec_aliases[i].alias;
+    return NULL;
+}
 #endif
 
 /***********************************************************************
@@ -5268,7 +5309,24 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             if (status == STATUS_SUCCESS)
             {
                 base = view->base;
-                if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
+                if (vprot & VPROT_EXEC || force_exec_prot)
+                {
+#ifdef __APPLE__
+                    { static int n; if (n++ < 12) ERR("DUALDIAG execalloc base=%p size=%zx attrs=%x dualmap=%d\n",  /* DUALDIAG-REMOVE */
+                        base, size, attributes, !!(attributes & MEM_EXTENDED_PARAMETER_FEX_DUALMAP)); }
+                    if (attributes & MEM_EXTENDED_PARAMETER_FEX_DUALMAP)
+                    {
+                        /* proton-mac JIT W^X: keep the base RW (drop EXEC — macOS won't honor W+X) and
+                         * mach_vm_remap a separate RX alias; FEX executes via the alias (query below). */
+                        void *alias;
+                        mprotect_range( base, size, 0, VPROT_EXEC );
+                        alias = create_fex_exec_alias( base, size );
+                        ERR("DUALDIAG created alias base=%p -> %p\n", base, alias);   /* DUALDIAG-REMOVE */
+                    }
+                    else
+#endif
+                        mprotect_range( base, size, 0, 0 );
+                }
             }
         }
     }
@@ -6291,6 +6349,20 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
 
         case MemoryImageInformation:
             return get_memory_image_info( process, addr, buffer, len, res_len );
+
+#ifdef __APPLE__
+        case MemoryFexExecAlias:   /* proton-mac: RX exec alias for a FEX-dualmap JIT write base */
+            if (process == GetCurrentProcess())
+            {
+                void *alias;
+                if (len < sizeof(void *)) return STATUS_INFO_LENGTH_MISMATCH;
+                if (!(alias = find_fex_exec_alias( addr ))) return STATUS_INVALID_ADDRESS;
+                *(void **)buffer = alias;
+                if (res_len) *res_len = sizeof(void *);
+                return STATUS_SUCCESS;
+            }
+            return STATUS_INVALID_HANDLE;
+#endif
 
         case MemoryWineLoadUnixLib:
         case MemoryWineLoadUnixLibWow64:

@@ -2447,6 +2447,7 @@ typedef enum _MEMORY_INFORMATION_CLASS {
     MemoryWineUnloadUnixLib,
 #endif
     MemoryFexStatsShm = 2000,
+    MemoryFexExecAlias = 2001,   /* proton-mac: return the RX exec alias for a FEX-dualmap JIT write base */
 } MEMORY_INFORMATION_CLASS;
 
 typedef struct _MEMORY_SECTION_NAME
