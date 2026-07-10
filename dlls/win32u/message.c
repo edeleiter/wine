@@ -2928,6 +2928,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
 {
     LRESULT result;
     HWND hwnd = filter->hwnd;
+    { static int qn; if (qn++ < 30) ERR("PMPEEK2 peek_message hwnd=%p first=%x last=%x flags=%x\n", filter->hwnd, filter->first, filter->last, filter->flags); }
     UINT first = filter->first, last = filter->last, flags = filter->flags;
     struct user_thread_info *thread_info = get_user_thread_info();
     INPUT_MESSAGE_SOURCE prev_source = thread_info->client_info.msg_source;
@@ -3319,6 +3320,7 @@ static BOOL process_driver_events( UINT events_mask, UINT wake_mask, UINT change
 {
     BOOL drained = FALSE;
 
+    { static int sn; if (sn++ < 20) ERR("PMSANITY process_driver_events mask=%x qs_driver=%d\n", events_mask, check_internal_bits(QS_DRIVER)); }
     if (check_internal_bits( QS_DRIVER )) drained = user_driver->pProcessEvents( events_mask );
 
     if (drained || !check_queue_masks( wake_mask, changed_mask ))
@@ -3542,7 +3544,9 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
     user_check_not_lock();
     check_for_driver_events();
 
-    if ((ret = peek_message( &msg, &filter )) <= 0)
+    ret = peek_message( &msg, &filter );
+    { static int pn; if (pn++ < 40) ERR("PMPEEK ret=%d msg=%x hwnd=%p wp=%lx\n", ret, ret>0?(unsigned)msg.message:0u, ret>0?msg.hwnd:0, ret>0?(long)msg.wParam:0); }
+    if (ret <= 0)
     {
         if (!ret)
         {

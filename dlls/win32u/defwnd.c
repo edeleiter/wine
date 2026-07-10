@@ -1830,7 +1830,15 @@ static LRESULT handle_nc_paint( HWND hwnd , HRGN clip )
         nc_paint( hwnd, clip );
 
         if (parent == get_desktop_window())
-            NtUserPostMessage( parent, WM_PARENTNOTIFY, WM_NCPAINT, (LPARAM)hwnd );
+#ifdef __APPLE__
+            /* proton-mac stub-desktop compensation: in the in-process explorer-bypass the desktop window
+             * is owned by the guest's own thread, so this WM_PARENTNOTIFY loops back into the guest queue
+             * and keeps QS_POSTMESSAGE set, wedging the pump. Suppress the pointless self-notification
+             * while the desktop has no separate owner thread; transparent once a real desktop process
+             * exists. Retired by Spike-3's real desktop-owner thread. */
+            if (get_window_thread( parent, NULL ) != GetCurrentThreadId())
+#endif
+                NtUserPostMessage( parent, WM_PARENTNOTIFY, WM_NCPAINT, (LPARAM)hwnd );
     }
     return 0;
 }
@@ -1853,7 +1861,16 @@ static LRESULT handle_nc_activate( HWND hwnd, WPARAM wparam, LPARAM lparam )
         nc_paint( hwnd, (HRGN)1 );
 
         if (NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())
-            NtUserPostMessage( get_desktop_window(), WM_PARENTNOTIFY, WM_NCACTIVATE, (LPARAM)hwnd );
+#ifdef __APPLE__
+            /* proton-mac stub-desktop compensation: in the in-process explorer-bypass the desktop window
+             * is owned by the guest's own thread, so this WM_PARENTNOTIFY loops back into the guest queue
+             * and floods the message pump (never reaching a fixed point). Suppress the pointless
+             * self-notification while the desktop has no separate owner thread. When a real desktop
+             * process exists (post-Spike-3) the desktop is another thread and this guard is transparent.
+             * Retired by Spike-3's real desktop-owner thread. */
+            if (get_window_thread( get_desktop_window(), NULL ) != GetCurrentThreadId())
+#endif
+                NtUserPostMessage( get_desktop_window(), WM_PARENTNOTIFY, WM_NCACTIVATE, (LPARAM)hwnd );
     }
 
     return TRUE;

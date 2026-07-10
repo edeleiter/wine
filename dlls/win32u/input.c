@@ -2075,7 +2075,16 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
                       MAKEWPARAM( mouse ? WA_CLICKACTIVE : WA_ACTIVE, is_iconic(hwnd) ? 0x20 : 0 ),
                       (LPARAM)previous );
         if (NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())
-            NtUserPostMessage( get_desktop_window(), WM_PARENTNOTIFY, WM_NCACTIVATE, (LPARAM)hwnd );
+#ifdef __APPLE__
+            /* proton-mac stub-desktop compensation: in the in-process explorer-bypass the desktop window
+             * is owned by the guest's own thread, so this WM_PARENTNOTIFY loops back into the guest queue
+             * and floods the message pump (never reaching a fixed point). Suppress the pointless
+             * self-notification while the desktop has no separate owner thread. When a real desktop
+             * process exists (post-Spike-3) the desktop is another thread and this guard is transparent.
+             * Retired by Spike-3's real desktop-owner thread. */
+            if (get_window_thread( get_desktop_window(), NULL ) != GetCurrentThreadId())
+#endif
+                NtUserPostMessage( get_desktop_window(), WM_PARENTNOTIFY, WM_NCACTIVATE, (LPARAM)hwnd );
     }
 
     /* now change focus if necessary */

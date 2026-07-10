@@ -3187,6 +3187,15 @@ DECL_HANDLER(send_message)
         msg->data      = NULL;
         msg->data_size = get_req_data_size();
 
+        {
+            static int pmn; static FILE *pmf;
+            if (pmn < 80) { pmn++;
+                if (!pmf) pmf = fopen( "/tmp/pmprobe.log", "a" );
+                if (pmf) { fprintf( pmf, "PMPROBE post msg=%x type=%d from tid=%04x -> tid=%04x win=%08x\n",
+                         (unsigned)req->msg, msg->type, current->id, thread->id, (unsigned)req->win ); fflush( pmf ); }
+            }
+        }
+
         get_message_defaults( recv_queue, &msg->x, &msg->y, &msg->time );
 
         if (msg->data_size && !(msg->data = memdup( get_req_data(), msg->data_size )))
@@ -3307,6 +3316,16 @@ DECL_HANDLER(get_message)
 
     if (!queue) return;
     queue_shm = queue->shared;
+
+    {
+        static int pmg; static FILE *pgf;
+        if (pmg < 80) { pmg++;
+            if (!pgf) pgf = fopen( "/tmp/pmprobe.log", "a" );
+            if (pgf) { fprintf( pgf, "PMPROBE get_message ENTER tid=%04x flags=%x get_win=%08x wake=%x changed=%x internal=%x\n",
+                     current->id, (unsigned)req->flags, (unsigned)req->get_win,
+                     (unsigned)queue_shm->wake_bits, (unsigned)queue_shm->changed_bits, (unsigned)queue_shm->internal_bits ); fflush( pgf ); }
+        }
+    }
 
     /* check for any hardware internal message */
     if (get_hardware_message( current, req->hw_id, get_win, WM_WINE_FIRST_DRIVER_MSG,
@@ -3529,6 +3548,16 @@ DECL_HANDLER(set_win_timer)
                     return;
                 }
             }
+        }
+    }
+
+    if (req->rate < 16 || (req->msg != 0x0113 /* WM_TIMER */ && req->msg != 0x0118 /* WM_SYSTIMER */))
+    {
+        static int pmt; static FILE *pmtf;
+        if (pmt < 40) { pmt++;
+            if (!pmtf) pmtf = fopen( "/tmp/pmprobe.log", "a" );
+            if (pmtf) { fprintf( pmtf, "PMPROBE set_win_timer msg=%x rate=%u win=%08x tid=%04x\n",
+                     (unsigned)req->msg, (unsigned)req->rate, (unsigned)req->win, current->id ); fflush( pmtf ); }
         }
     }
 

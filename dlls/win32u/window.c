@@ -5991,7 +5991,15 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
     }
 
     if (parent == get_desktop_window())
-        NtUserPostMessage( parent, WM_PARENTNOTIFY, WM_CREATE, (LPARAM)hwnd );
+#ifdef __APPLE__
+        /* proton-mac stub-desktop compensation: in the in-process explorer-bypass the desktop window is
+         * owned by the guest's own thread, so this WM_PARENTNOTIFY loops back into the guest queue and
+         * keeps QS_POSTMESSAGE set, wedging the pump. Suppress the pointless self-notification while the
+         * desktop has no separate owner thread; transparent once a real desktop process exists. Retired
+         * by Spike-3's real desktop-owner thread. */
+        if (get_window_thread( parent, NULL ) != GetCurrentThreadId())
+#endif
+            NtUserPostMessage( parent, WM_PARENTNOTIFY, WM_CREATE, (LPARAM)hwnd );
 
     if (cs.style & WS_VISIBLE)
     {

@@ -244,6 +244,7 @@ static void init_limits(void)
 int main( int argc, char *argv[] )
 {
     setvbuf( stderr, NULL, _IOLBF, 0 );
+    { FILE *f = fopen( "/tmp/pmprobe_start.log", "a" ); if (f) { fprintf( f, "PMPROBE wineserver main() started argv0=%s\n", argv[0] ); fclose( f ); } }
     server_argv0 = argv[0];
     parse_options( argc, argv, "d::fhk::p::vw", long_options, option_callback );
 

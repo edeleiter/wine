@@ -1769,6 +1769,22 @@ void macdrv_window_got_focus(HWND hwnd, const macdrv_event *event)
 }
 
 
+#ifdef __APPLE__
+/* proton-mac: TRUE when the desktop window is owned by THIS process, i.e. the in-process explorer-bypass
+ * (no separate desktop/explorer process). In that topology the stub desktop is the ONLY foreground
+ * fallback yet can_window_become_foreground(desktop)==FALSE, so force-offering foreground to it (below and
+ * in macdrv_app_deactivated) creates a guest<->desktop foreground oscillation that never converges and
+ * wedges the message pump at 100% CPU (S1b.7 "U6 face B"). We suppress the re-offer in that case so
+ * foreground comes to rest on the guest window (or NULL). Transparent once a real desktop process exists
+ * (post-Spike-3): then the desktop is owned by another process and this returns FALSE. */
+static BOOL desktop_owned_in_process(void)
+{
+    DWORD pid = 0;
+    NtUserGetWindowThread( NtUserGetDesktopWindow(), &pid );
+    return pid == GetCurrentProcessId();
+}
+#endif
+
 /***********************************************************************
  *              macdrv_window_lost_focus
  *
@@ -1783,6 +1799,9 @@ void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event)
     if (hwnd == NtUserGetForegroundWindow())
     {
         send_message(hwnd, WM_CANCELMODE, 0, 0);
+#ifdef __APPLE__
+        if (desktop_owned_in_process()) return;   /* don't re-offer fg to the ineligible in-process desktop */
+#endif
         if (hwnd == NtUserGetForegroundWindow())
             NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
     }
@@ -1809,6 +1828,10 @@ void macdrv_app_activated(void)
 void macdrv_app_deactivated(void)
 {
     NtUserClipCursor(NULL);
+
+#ifdef __APPLE__
+    if (desktop_owned_in_process()) return;   /* don't re-offer fg to the ineligible in-process desktop (U6-B) */
+#endif
 
     if (get_active_window() == NtUserGetForegroundWindow())
     {
