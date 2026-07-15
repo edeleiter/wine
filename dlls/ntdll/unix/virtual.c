@@ -142,6 +142,7 @@ struct file_view
 /* per-mapping protection flags */
 #define VPROT_ARM64EC          0x0100  /* view may contain ARM64EC code */
 #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
+#define VPROT_EMULATED         0x1000  /* proton-mac R11b: pure-emulated x64 image; host mapping drops PROT_EXEC */
 #define VPROT_PLACEHOLDER      0x0400
 #define VPROT_FREE_PLACEHOLDER 0x0800
 
@@ -2141,6 +2142,14 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
         else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
         set_page_vprot( base, size, vprot );
     }
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* proton-mac R11b: for a pure-emulated x64 image, strip PROT_EXEC from the HOST mapping (the
+     * shadow vprot set above keeps VPROT_EXEC, so guest-visible semantics are unchanged). The bytes
+     * are only read by FEX's JIT, never host-executed, so this avoids a RWX host page when 4KB
+     * sections share a 16KB host page. No x18 exec-warming either -- these pages are never the
+     * target of a host branch. */
+    if (view->protect & VPROT_EMULATED) return !mprotect_range( base, size, 0, VPROT_EXEC );
+#endif
     if (mprotect_range( base, size, 0, 0 )) return FALSE;
 #if defined(__APPLE__) && defined(__aarch64__)
     /* proton-mac: re-warm exec pages after every ->RX transition (map AND relocation re-protect),
@@ -3356,6 +3365,17 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (image_info->machine == IMAGE_FILE_MACHINE_AMD64)
             update_arm64ec_ranges( view, nt, dir, &image_info->entry_point );
     }
+#endif
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* proton-mac R11b: a pure-emulated (x64, no ARM64EC ranges) image never runs as host
+     * instructions -- FEX reads its bytes and JIT-translates them into its own code buffers. Mark
+     * the view so the host mprotect drops PROT_EXEC (the shadow vprot still carries VPROT_EXEC for
+     * guest-visible semantics). This lets a 4KB-section-aligned stock binary map on 16KB host pages
+     * without producing a RWX host page (macOS W^X rejects RWX -> the "noexec filesystem?" failure).
+     * VPROT_ARM64EC is set above (commit_arm64ec_map) for any hybrid ARM64X image, so this excludes
+     * images whose native ARM64 pages genuinely need host exec. */
+    if (image_info->machine == IMAGE_FILE_MACHINE_AMD64 && !(view->protect & VPROT_ARM64EC))
+        view->protect |= VPROT_EMULATED;
 #endif
     if (machine && machine != nt->FileHeader.Machine)
     {
