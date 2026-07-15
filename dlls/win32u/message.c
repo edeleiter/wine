@@ -45,7 +45,17 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 #define QS_HARDWARE     0x40000000
 #define QS_INTERNAL     (QS_DRIVER | QS_HARDWARE)
 
+/* proton-mac: KUSER_SHARED_DATA cannot live at its ABI address 0x7ffe0000 on macOS (low-4GB
+ * __PAGEZERO wall) and is relocated at map time (see ntdll/proton_mac.h). Reading the ABI
+ * address here takes a data abort that handle_syscall_fault converts into a c0000005 syscall
+ * "return", so PeekMessage/GetMessage report fake success with the MSG unwritten and the
+ * message pump spins forever (R1a). Same single-sourced address as ntdll's two copies. */
+#ifdef __APPLE__
+#include "../ntdll/proton_mac.h"
+static const struct _KUSER_SHARED_DATA *user_shared_data = (const struct _KUSER_SHARED_DATA *)PROTON_MAC_KUSER_ADDR;
+#else
 static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
+#endif
 
 static LONG atomic_load_long( const volatile LONG *ptr )
 {

@@ -39,7 +39,15 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(process);
 
+/* proton-mac: KUSER_SHARED_DATA is relocated on macOS (low-4GB __PAGEZERO wall makes the ABI
+ * address 0x7ffe0000 unmappable); reading the ABI address data-aborts. Single-sourced address,
+ * same pattern as ntdll/thread.c and win32u/message.c (which was the R1a message-pump spin). */
+#ifdef __APPLE__
+#include "../ntdll/proton_mac.h"
+static const struct _KUSER_SHARED_DATA *user_shared_data = (const struct _KUSER_SHARED_DATA *)PROTON_MAC_KUSER_ADDR;
+#else
 static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
+#endif
 
 typedef struct
 {

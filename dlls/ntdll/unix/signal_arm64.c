@@ -1253,6 +1253,46 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     RESTORE_TEB_REGISTER();
     esr = get_fault_esr( context );
 
+#ifdef __APPLE__
+    /* proton-mac R1a fault probe (observation-only, bounded): record faulting PC / x4 / addr so a fault at
+     * the user32 5-arg entry-thunk `ldr x4,[x4,#0x20]` (RVA 0x11fcd4) can be identified host-side (that PC is
+     * unique to 5-arg-i8 calls == PeekMessage in the trace guest). Skips the known-benign x18 cold-page
+     * recovery noise (x18==0 near-null data abort, handled just below). Does NOT touch the context. */
+    {
+        static int r1a_excn;
+        /* Skip ONLY true x18-base data aborts (the macOS cold-page recovery noise handled below), decoded
+         * from the faulting instruction's base register Rn (bits[9:5]) -- so a thunk `ldr x4,[x4,#0x20]`
+         * (base=x4) is ALWAYS logged even if x4 is near-null. Read *PC only for data aborts (PC then mapped). */
+        int r1a_exec_abort = ((esr & 0xf0000000) == 0x80000000);
+        unsigned r1a_instr = r1a_exec_abort ? 0 : *(ULONG *)PC_sig( context );
+        unsigned r1a_rn = (r1a_instr >> 5) & 0x1f;
+        /* Log ONLY hypothesis-relevant faults so FEX's x8/x18 cold-page recovery noise can't exhaust the cap
+         * before the PeekMessage call: (a) x4-base data aborts == the thunk `ldr x4,[x4,#0x20]`, or
+         * (b) any execute/prefetch abort == a `blr x9` into an unmapped target, or
+         * (c) any data abort at a REAL address (>=64KB) -- the PEEKW c0000005 fault: not x18/near-null
+         *     cold-page noise (those fault in the low 64KB), so this cannot exhaust the cap. */
+        int r1a_log = (!r1a_exec_abort && r1a_rn == 4) || r1a_exec_abort ||
+                      (!r1a_exec_abort && (ULONG_PTR)siginfo->si_addr >= 0x10000);
+        if (r1a_log && r1a_excn < 400)
+        {
+            FILE *ef = fopen( "/tmp/exc_probe.log", "a" );
+            r1a_excn++;
+            if (ef)
+            {
+                fprintf( ef, "EXC pc=%llx addr=%llx esr=%llx instr=%08x x18=%llx x4=%llx x9=%llx sp=%llx\n",
+                         (unsigned long long)PC_sig( context ),
+                         (unsigned long long)(ULONG_PTR)siginfo->si_addr,
+                         (unsigned long long)esr, r1a_instr,
+                         (unsigned long long)REGn_sig( 18, context ),
+                         (unsigned long long)REGn_sig( 4, context ),
+                         (unsigned long long)REGn_sig( 9, context ),
+                         (unsigned long long)SP_sig( context ) );
+                fclose( ef );
+            }
+        }
+    }
+#endif
+
     rec.NumberParameters = 2;
     if ((esr & 0xf0000000) == 0x80000000) rec.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
     else if (esr & 0x40) rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
