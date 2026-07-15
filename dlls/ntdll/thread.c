@@ -36,14 +36,12 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 WINE_DECLARE_DEBUG_CHANNEL(pid);
 WINE_DECLARE_DEBUG_CHANNEL(timestamp);
 
-/* proton-mac: KUSER relocated to the 16TB fixed slot. Address single-sourced in
- * proton_mac.h (PROTON_MAC_KUSER_ADDR) so this and unix/virtual.c cannot diverge.
- * x64-guest absolute 0x7ffe0000 reads are the separate M5 fault-emulate problem. */
-#ifdef __APPLE__
+/* proton-mac (M5): KUSER relocated to the 16TB fixed slot; single-sourced in proton_mac.h.
+ * UNCONDITIONAL on purpose: __APPLE__ is not defined for PE-target compiles
+ * (aarch64-/arm64ec-windows), which made the previous #ifdef form dead code on the PE side
+ * (the PE slot held 0x7ffe0000 and PE-side readers like NtGetTickCount faulted); this fork
+ * builds only on macOS and proton_mac.h exists only in this fork. */
 struct _KUSER_SHARED_DATA *user_shared_data = PROTON_MAC_KUSER_ADDR;
-#else
-struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
-#endif
 
 struct debug_info
 {

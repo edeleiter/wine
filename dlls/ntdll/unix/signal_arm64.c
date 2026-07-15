@@ -58,6 +58,7 @@
 #include "wine/asm.h"
 #include "unix_private.h"
 #include "wine/debug.h"
+#include "proton_mac.h"   /* proton-mac M5: PROTON_MAC_KUSER_ADDR */
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 
@@ -1240,6 +1241,78 @@ static BOOL emulate_teb_load_store( ucontext_t *context, ULONG instr )
     }
     return TRUE;
 }
+
+/* proton-mac M5 (layer 1): emulate an integer load whose EA fell in the KUSER_SHARED_DATA ABI
+ * window [0x7ffe0000, 0x7ffe1000) -- unmappable on macOS; the live page is at
+ * PROTON_MAC_KUSER_ADDR. si_addr is authoritative for the EA, so only Rt/width/extension are
+ * decoded (src already points into the relocated page). Covers the scalar forms compilers emit
+ * for KUSER fields: LDR/LDRB/LDRH/LDRSx (unsigned imm), LDURx (unscaled), LDR (register offset),
+ * LDP (signed offset, no writeback), the acquire form LDARx (win32u's interlocked TickCount read
+ * was LDAR w8), and LDAPURx (RCpc acquire-unscaled -- the form FEX emits for emulated guest loads
+ * under TSO, so the common case for guest binaries). NOT emulated (caller logs once + lets the
+ * fault surface, visible-not-silent): SIMD/FP (V=1), exclusive/atomic RMW, LDP writeback forms.
+ * Writes never reach here (caller gates on ESR WnR). Returns TRUE if emulated (caller advances
+ * PC by 4). */
+static BOOL emulate_kuser_load( ucontext_t *context, ULONG instr, const void *src )
+{
+    ULONG rt = instr & 0x1f;
+
+    if ((instr & 0x3ffffc00) == 0x08dffc00)            /* LDAR/LDARB/LDARH/LDAR-X: size in 31:30 */
+    {
+        ULONG size = instr >> 30;
+        ULONG64 val = 0;
+        memcpy( &val, src, (size_t)1 << size );
+        if (rt != 31) REGn_sig( rt, context ) = val;
+        return TRUE;
+    }
+    if ((instr & 0x7fc00000) == 0x29400000 ||          /* LDP Wt,Wt2 (opc=00) */
+        (instr & 0x7fc00000) == 0x69400000 ||          /* LDPSW Xt,Xt2 (opc=01) */
+        (instr & 0x7fc00000) == 0xa9400000)            /* LDP Xt,Xt2 (opc=10) */
+    {
+        ULONG rt2 = (instr >> 10) & 0x1f;
+        ULONG opc = instr >> 30;                        /* 0=W pair, 1=SW pair, 2=X pair */
+        ULONG width = (opc == 2) ? 8 : 4;
+        ULONG64 v1 = 0, v2 = 0;
+        memcpy( &v1, src, width );
+        memcpy( &v2, (const char *)src + width, width );
+        if (opc == 1) { v1 = (ULONG64)(LONG64)(LONG)v1; v2 = (ULONG64)(LONG64)(LONG)v2; }
+        if (rt  != 31) REGn_sig( rt,  context ) = v1;
+        if (rt2 != 31) REGn_sig( rt2, context ) = v2;
+        return TRUE;
+    }
+    /* LDR family, integer (V=0), loads only (opc != 0), excluding prefetch (size=3, opc>=2):
+     *   unsigned imm:  size 111001 opc imm12 Rn Rt
+     *   unscaled LDUR: size 111000 opc 0 imm9 00 Rn Rt
+     *   reg offset:    size 111000 opc 1 Rm opt S 10 Rn Rt
+     *   LDAPUR:        size 011001 opc 0 imm9 00 Rn Rt   (RCpc acquire-unscaled -- this is what
+     *                     FEX emits for emulated guest loads under TSO; opc/size semantics identical
+     *                     to the LDR family, so it folds into the same extension logic below). */
+    {
+        ULONG form_imm  = (instr & 0x3b000000) == 0x39000000;
+        ULONG form_unsc = (instr & 0x3b200c00) == 0x38000000;
+        ULONG form_reg  = (instr & 0x3b200c00) == 0x38200800;
+        ULONG form_ldapur = (instr & 0x3f200c00) == 0x19000000;
+        ULONG opc  = (instr >> 22) & 3;
+        ULONG size = instr >> 30;
+        if ((form_imm || form_unsc || form_reg || form_ldapur) && !(instr & 0x04000000) /* V=0 */ &&
+            opc != 0 && !(size == 3 && opc >= 2) /* no PRFM/PRFUM */)
+        {
+            ULONG width = 1u << size;
+            ULONG64 raw = 0, val;
+            memcpy( &raw, src, width );
+            if (opc == 1) val = raw;                          /* zero-extend */
+            else
+            {
+                ULONG64 sbit = 1ull << (width * 8 - 1);       /* sign-extend to 64 */
+                val = (raw ^ sbit) - sbit;
+                if (opc == 3) val = (ULONG)val;               /* signed to 32-bit dest */
+            }
+            if (rt != 31) REGn_sig( rt, context ) = val;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
 #else
 #define RESTORE_TEB_REGISTER() do {} while (0)
 #endif
@@ -1349,6 +1422,35 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             ULONG64 teb = (ULONG64)(ULONG_PTR)pthread_getspecific( teb_key );
             if (rn != 31) REGn_sig( rn, context ) = teb + REGn_sig( rn, context );  /* base now points into TEB */
             return;                            /* re-execute at the same PC with the corrected base */
+        }
+    }
+#endif
+#ifdef __APPLE__
+    /* proton-mac M5 (layer 1): reads of the KUSER_SHARED_DATA ABI window are emulated against the
+     * relocated page and never surface to the app; writes fall through (the page is read-only on
+     * Windows -- an AV is the correct behavior). Counter logged at each power-of-two (diagnostic;
+     * inter-thread races on the counter are acceptable). */
+    if ((esr & 0xf0000000) != 0x80000000 &&                      /* data abort, not exec */
+        !(esr & 0x40) &&                                          /* read, not write (WnR) */
+        (ULONG_PTR)siginfo->si_addr >= 0x7ffe0000 &&
+        (ULONG_PTR)siginfo->si_addr <  0x7ffe1000)
+    {
+        ULONG m5_instr = *(ULONG *)PC_sig( context );
+        const void *m5_src = (const char *)PROTON_MAC_KUSER_ADDR +
+                             ((ULONG_PTR)siginfo->si_addr - 0x7ffe0000);
+        if (emulate_kuser_load( context, m5_instr, m5_src ))
+        {
+            static unsigned int m5_count;
+            unsigned int n = ++m5_count;
+            if (!(n & (n - 1))) ERR( "M5: %u KUSER reads emulated (pc=%llx instr=%08x)\n",
+                                     n, (unsigned long long)PC_sig(context), m5_instr );
+            PC_sig( context ) += 4;
+            return;
+        }
+        {
+            static int m5_warned;
+            if (!m5_warned++) ERR( "M5: unhandled KUSER read form %08x at pc=%llx (fault surfaces)\n",
+                                   m5_instr, (unsigned long long)PC_sig(context) );
         }
     }
 #endif

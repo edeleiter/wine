@@ -216,14 +216,12 @@ static void *host_addr_space_limit;  /* top of the host virtual address space */
 static struct file_view *arm64ec_view;
 
 ULONG_PTR user_space_wow_limit = 0;
-/* proton-mac: KUSER_SHARED_DATA fixed slot at 16TB, just below address_space_start,
+/* proton-mac (M5): KUSER_SHARED_DATA fixed slot at 16TB, just below address_space_start,
  * so it is carved out of the general allocation range. The address is single-sourced
- * in proton_mac.h (PROTON_MAC_KUSER_ADDR) so this and thread.c cannot diverge. */
-#ifdef __APPLE__
+ * in proton_mac.h (PROTON_MAC_KUSER_ADDR) so this and thread.c cannot diverge.
+ * UNCONDITIONAL for pattern consistency with the PE-side sites, where #ifdef __APPLE__
+ * is never defined and was dead code (this fork builds only on macOS). */
 struct _KUSER_SHARED_DATA *user_shared_data = PROTON_MAC_KUSER_ADDR;
-#else
-struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
-#endif
 
 /* TEB allocation blocks */
 static void *teb_block;
