@@ -1052,6 +1052,38 @@ static int object_sync_signaled( struct object *obj, struct wait_queue_entry *en
     return ret;
 }
 
+/* proton-mac DIAGNOSTIC (Superposition world-load hang, Spike 2): dump the full wait graph.
+ * For every parked thread, print each waited object and whether it is ALREADY signaled,
+ * using the server's own predicate (object_sync_signaled). Triggered by SIGHUP -> sighup_callback.
+ * Discriminator: a parked thread on an already-signaled object => LOST-WAKEUP (substrate bug);
+ * all objects unsignaled + a signaller cycle => APP-DEADLOCK (timing-exposed). Pure reads only. */
+void dump_wait_graph(void)
+{
+    struct thread *thread;
+    int nparked = 0;
+
+    fprintf( stderr, "=== WAIT GRAPH DUMP (proton-mac diagnostic) ===\n" );
+    LIST_FOR_EACH_ENTRY( thread, &thread_list, struct thread, entry )
+    {
+        struct thread_wait *wait = thread->wait;
+        int i;
+        if (!wait) continue;
+        nparked++;
+        fprintf( stderr, "tid=%04x unix_tid=%d state=%d select=%d flags=%08x count=%d when=%s cookie=%08lx\n",
+                 thread->id, thread->unix_tid, thread->state, wait->select, wait->flags, wait->count,
+                 wait->when ? "timed" : "INFINITE", (unsigned long)wait->cookie );
+        for (i = 0; i < wait->count; i++)
+        {
+            struct object *obj = wait->queues[i].obj;
+            int sig = object_sync_signaled( obj, &wait->queues[i] );
+            fprintf( stderr, "    [%d] obj=%p ops=%p SIGNALED=%d  ", i, obj, obj->ops, sig );
+            if (obj->ops->dump) obj->ops->dump( obj, 1 );
+            else fprintf( stderr, "(no dump op)\n" );
+        }
+    }
+    fprintf( stderr, "=== END WAIT GRAPH (%d parked threads) ===\n", nparked );
+}
+
 void signal_sync( struct object *obj )
 {
     obj->ops->signal( obj, 0, 1 );

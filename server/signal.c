@@ -177,6 +177,7 @@ static void sighup_callback(void)
 #ifdef DEBUG_OBJECTS
     dump_objects();
 #endif
+    dump_wait_graph();  /* proton-mac diagnostic: dump the full wait graph on SIGHUP */
 }
 
 /* SIGTERM callback */

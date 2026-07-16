@@ -30,6 +30,11 @@
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
 
+/* proton-mac DIAGNOSTIC (QS_DRIVER busy-spin): count doorbell writes by source, to identify the
+ * perpetual re-signaller during the spin. Read by the PMDRAIN probe in event.c. */
+long g_wine_doorbell_total = 0;   /* every signalEventAvailable */
+long g_wine_doorbell_omt   = 0;   /* the OnMainThread completion wakeup (unpaired with an event) */
+
 static NSString* const WineEventQueueThreadDictionaryKey = @"WineEventQueueThreadDictionaryKey";
 
 static NSString* const WineHotKeyMacIDKey       = @"macID";
@@ -182,6 +187,8 @@ static const OSType WineHotKeySignature = 'Wine';
     {
         char junk = 1;
         int rc;
+
+        __atomic_add_fetch(&g_wine_doorbell_total, 1, __ATOMIC_RELAXED);
 
         do
         {
@@ -516,7 +523,10 @@ void OnMainThread(dispatch_block_t block)
         block();
         finished = TRUE;
         if (queue)
+        {
+            __atomic_add_fetch(&g_wine_doorbell_omt, 1, __ATOMIC_RELAXED);
             [queue signalEventAvailable];
+        }
         else
         {
             dispatch_semaphore_signal(semaphore);

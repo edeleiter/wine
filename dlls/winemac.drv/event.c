@@ -521,5 +521,15 @@ BOOL macdrv_ProcessEvents(DWORD mask)
     }
 
     if (count) TRACE("processed %d events\n", count);
+    /* proton-mac DIAGNOSTIC (Superposition QS_DRIVER busy-spin): why does the drain never
+     * clear QS_DRIVER? Log the suppression state, drained count, and whether the queue fd is
+     * still readable while 0 events dequeued (phantom-readable fd vs stuck current_event). */
+    { extern long g_wine_doorbell_total, g_wine_doorbell_omt;
+      static int dn; int fdready = check_fd_events(macdrv_get_event_queue_fd(data->queue), POLLIN|POLLHUP|POLLERR);
+      if (dn++ < 60) ERR("PMDRAIN mask=%x evmask=%llx cur_event=%s count=%d fd_revents=%x doorbell tot=%ld omt=%ld -> drained=%d\n",
+          mask, (unsigned long long)event_mask,
+          data->current_event ? "SET" : "null", count, fdready,
+          g_wine_doorbell_total, g_wine_doorbell_omt,
+          (mask == QS_ALLINPUT && !check_fd_events(macdrv_get_event_queue_fd(data->queue), POLLIN))); }
     return mask == QS_ALLINPUT && !check_fd_events(macdrv_get_event_queue_fd(data->queue), POLLIN);
 }
