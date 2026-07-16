@@ -1137,6 +1137,13 @@ static inline void restore_teb_register(void)
 }
 #define RESTORE_TEB_REGISTER() restore_teb_register()
 
+/* proton-mac DIAGNOSTIC (x18/TEB fault-storm quantifier, Step 1): count emulated [x18,#imm] TEB faults,
+ * splitting out the FEX dispatcher's TEB->ChpeV2CpuAreaInfo reload (offset 0x1788, so si_addr==0x1788 when
+ * x18==0). Record-only (no I/O in the storm path); read via lldb by numeric address, twice N seconds apart,
+ * to get faults/sec. Revert before ship. */
+unsigned long long g_x18_total = 0;
+unsigned long long g_x18_1788  = 0;
+
 /* proton-mac: emulate a faulting x18-based integer load/store IN the handler and advance PC,
  * instead of re-executing it on the cold RX page (whose first execution re-zeroes x18 -> the
  * same instruction data-faults again -> infinite loop; see the segv_handler x18 block). This
@@ -1485,6 +1492,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
              * also avoids the cold-page re-fault loop. */
             if (emulate_teb_load_store( context, instr ))
             {
+                g_x18_total++;                                             /* proton-mac Step-1 diag */
+                if ((ULONG_PTR)siginfo->si_addr == 0x1788) g_x18_1788++;   /* the ChpeV2CpuAreaInfo reload */
                 PC_sig( context ) += 4;
                 return;
             }
