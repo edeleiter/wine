@@ -2187,6 +2187,23 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
 
 
 /***********************************************************************
+ *           commit_arm64ec_map_range
+ *
+ * Make sure that the pages corresponding to an arbitrary address range are
+ * committed in the ARM64EC code map. Used both for file views and, on
+ * proton-mac, for the JIT dual-map exec alias (which has no file_view).
+ */
+static void commit_arm64ec_map_range( const void *addr, size_t map_size )
+{
+    size_t start = ((size_t)addr >> page_shift) / 8;
+    size_t end = (((size_t)addr + map_size) >> page_shift) / 8;
+    size_t size = ROUND_SIZE( start, end + 1 - start, page_mask );
+    void *base = ROUND_ADDR( (char *)arm64ec_view->base + start, page_mask );
+
+    set_vprot( arm64ec_view, base, size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+}
+
+/***********************************************************************
  *           commit_arm64ec_map
  *
  * Make sure that the pages corresponding to the address range of the view
@@ -2194,13 +2211,8 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
  */
 static void commit_arm64ec_map( struct file_view *view )
 {
-    size_t start = ((size_t)view->base >> page_shift) / 8;
-    size_t end = (((size_t)view->base + view->size) >> page_shift) / 8;
-    size_t size = ROUND_SIZE( start, end + 1 - start, page_mask );
-    void *base = ROUND_ADDR( (char *)arm64ec_view->base + start, page_mask );
-
     view->protect |= VPROT_ARM64EC;
-    set_vprot( arm64ec_view, base, size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+    commit_arm64ec_map_range( view->base, view->size );
 }
 
 
@@ -5369,6 +5381,22 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     {
         commit_arm64ec_map( view );
         set_arm64ec_range( base, size );
+#ifdef __APPLE__
+        /* proton-mac JIT W^X dual-map: the base is RW and never executed; JIT code executes from the
+         * separate RX exec alias. The alias VA must ALSO be marked as ARM64EC code, otherwise
+         * RtlIsEcCode(alias)==0 and the substrate treats every live JIT program counter as x86 — any
+         * native resume to an alias PC then diverts through KiUserEmulationDispatcher and the alias is
+         * loaded as a guest RIP. Mirror the base's EC-marking for the alias. */
+        if (attributes & MEM_EXTENDED_PARAMETER_FEX_DUALMAP)
+        {
+            void *alias = find_fex_exec_alias( base );
+            if (alias)
+            {
+                commit_arm64ec_map_range( alias, size );
+                set_arm64ec_range( alias, size );
+            }
+        }
+#endif
     }
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
