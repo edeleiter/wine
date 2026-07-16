@@ -5725,6 +5725,12 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
            ex_style, debugstr_us(class_name), debugstr_us(version), debugstr_us(window_name), style, x, y, cx, cy,
            parent, menu, class_instance, params, flags, instance, debugstr_w(class), ansi );
 
+    /* proton-mac DIAGNOSTIC (window-creation loop): is creation unbounded (count grows forever) or bounded?
+     * Log a capped, monotonic count + parent + class per create. */
+    { static LONG cwe; LONG n = InterlockedIncrement( &cwe );
+      if (n < 4000) ERR( "CWEPROBE n=%d parent=%p style=%#x class=%s name=%s\n",
+                         (int)n, parent, style, debugstr_us(class_name), debugstr_us(window_name) ); }
+
     cs.lpCreateParams = params;
     cs.hInstance  = instance ? instance : class_instance;
     cs.hMenu      = menu;

@@ -1593,6 +1593,11 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
     unsigned int new_style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     struct window_rects old_rects;
 
+    /* proton-mac DIAGNOSTIC (window-creation loop): count pos-changes per hwnd over time -- does the create
+     * counter freeze while these keep firing on a fixed hwnd set (downstream loop), or grow (unbounded)? */
+    { static LONG wpc; LONG n = InterlockedIncrement( &wpc );
+      if (n < 4000) ERR( "WPCPROBE n=%d hwnd=%p swp=%#x\n", (int)n, hwnd, swp_flags ); }
+
     if (!(data = get_win_data(hwnd))) return;
 
     thread_data = macdrv_thread_data();
