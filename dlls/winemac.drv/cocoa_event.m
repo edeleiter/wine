@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <sys/event.h>
 #include <sys/time.h>
+#include <execinfo.h>
 
 #include "macdrv_cocoa.h"
 #import "cocoa_event.h"
@@ -29,6 +30,11 @@
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
+
+/* proton-mac: fixed (ident, filter) key for the EVFILT_USER wakeup that OnMainThread uses to wake its
+ * caller's kevent() without writing the server-polled event pipe. Any value distinct from real fds is fine
+ * (EVFILT_USER is a separate filter namespace from the EVFILT_READ on fds[0]). */
+#define WINE_MAINTHREAD_WAKE_IDENT ((uintptr_t)0x57494e45) /* 'WINE' */
 
 /* proton-mac DIAGNOSTIC (QS_DRIVER busy-spin): count doorbell writes by source, to identify the
  * perpetual re-signaller during the spin. Read by the PMDRAIN probe in event.c. */
@@ -157,8 +163,39 @@ static const OSType WineHotKeySignature = 'Wine';
                 [self release];
                 return nil;
             }
+
+            /* proton-mac: a user-triggered kevent used ONLY to wake this queue's OnMainThread wait loop on
+               main-thread-block completion. It must NOT go through the event pipe (fds), because wineserver
+               polls a dup of fds[0] and would treat any byte there as a pending driver event (QS_DRIVER),
+               which -- rung once per pump iteration by the engine's per-frame OnMainThread -- pins the
+               message pump at ~100% CPU (the Superposition "world-load hang"). EVFILT_USER wakes kevent()
+               without touching fds, so completions are invisible to the server. */
+            EV_SET(&kev, WINE_MAINTHREAD_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, 0);
+            do
+            {
+                rc = kevent(kq, &kev, 1, NULL, 0, NULL);
+            } while (rc == -1 && errno == EINTR);
+            if (rc == -1)
+            {
+                [self release];
+                return nil;
+            }
         }
         return self;
+    }
+
+    /* proton-mac: wake this queue's OnMainThread wait loop via the EVFILT_USER channel (see -init). */
+    - (void) signalMainThreadDone
+    {
+        struct kevent kev;
+        int rc;
+        EV_SET(&kev, WINE_MAINTHREAD_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, 0);
+        do
+        {
+            rc = kevent(kq, &kev, 1, NULL, 0, NULL);
+        } while (rc == -1 && errno == EINTR);
+        if (rc == -1)
+            ERR(@"%@: got error triggering main-thread-done EVFILT_USER: %s\n", self, strerror(errno));
     }
 
     - (void) dealloc
@@ -512,6 +549,13 @@ void OnMainThread(dispatch_block_t block)
     dispatch_semaphore_t semaphore = NULL;
     __block BOOL finished;
 
+    /* proton-mac DIAGNOSTIC: the engine calls OnMainThread every pump iteration during the hang. Backtrace
+     * the NATIVE caller (which macdrv API) for a window of calls that lands in the steady-state spin
+     * (startup issues fewer than this before the hang), to identify what condition it is polling for. */
+    { static int on; int c = __atomic_add_fetch(&on, 1, __ATOMIC_RELAXED);
+      if (c >= 50 && c < 54) { void* bt[24]; int n = backtrace(bt, 24);
+          ERR(@"ONMTBT call %d native caller stack:\n", c); backtrace_symbols_fd(bt, n, 2); } }
+
     if (!queue)
     {
         semaphore = dispatch_semaphore_create(0);
@@ -525,7 +569,10 @@ void OnMainThread(dispatch_block_t block)
         if (queue)
         {
             __atomic_add_fetch(&g_wine_doorbell_omt, 1, __ATOMIC_RELAXED);
-            [queue signalEventAvailable];
+            /* proton-mac: wake via EVFILT_USER, NOT the event pipe -- a completion is an internal thread
+               wakeup, not a windows driver event, so it must be invisible to wineserver's fds[0] poll
+               (else it spuriously re-sets QS_DRIVER every pump -> ~100%-CPU busy-spin). */
+            [queue signalMainThreadDone];
         }
         else
         {
