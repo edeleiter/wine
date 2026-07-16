@@ -1149,11 +1149,95 @@ static inline void restore_teb_register(void)
  * the caller reports them. x18 is already restored to TEB at handler entry, so NtCurrentTeb() is
  * valid; the effective base is always TEB (== the value x18 should hold). Decoder verified against
  * ARM ARM C4.1. */
+/* proton-mac: access a 128-bit V register in the macOS signal ucontext (uc_mcontext->__ns.__v[] is
+ * __uint128_t[32]; same field the file's save_fpu/restore_fpu use at lines ~264/286). A width-sized
+ * memcpy off &__v[Rt] covers B/H/S/D/Q since lane 0 is in the low bytes on little-endian arm64; loads
+ * zero-fill the whole 16-byte register (architectural). No Rt==31 special-case: FP encodings have no zr. */
+static inline void teb_simd_load( ucontext_t *ctx, unsigned Rt, const void *src, unsigned bytes )
+{
+    unsigned char v[16] = { 0 };
+    memcpy( v, src, bytes );
+    memcpy( &ctx->uc_mcontext->__ns.__v[Rt], v, sizeof(v) );
+}
+static inline void teb_simd_store( ucontext_t *ctx, unsigned Rt, void *dst, unsigned bytes )
+{
+    memcpy( dst, &ctx->uc_mcontext->__ns.__v[Rt], bytes );
+}
+
+/* proton-mac: SIMD/FP (V=1) analog of emulate_teb_load_store — emulate a faulting [x18,...] vector
+ * load/store on the cold-page x18==0 path. Register-transparent (writes only Vt), same emulate+advance
+ * contract. Landed as a PARALLEL function (address decode duplicated from the integer path) so the
+ * boot-critical integer path is byte-for-byte untouched; a shared-EA-helper refactor is a green-gated
+ * follow-up. SIMD datasize = (opc<1><<2)|size → 8/16/32/64/128-bit; opc<0> = L (1=load,0=store). SIMD
+ * addressing bases (0x3d/0x3c/0x2d) are disjoint from the integer bases (0x39/0x38/0x29). */
+static BOOL emulate_teb_simd_load_store( ucontext_t *context, ULONG instr )
+{
+    ULONG64 teb = (ULONG64)(ULONG_PTR)pthread_getspecific( teb_key );
+    unsigned int Rt = instr & 0x1f;
+    BYTE *addr;
+
+    /* SIMD LDP/STP (offset, no writeback): `opc 101 1 010 L imm7 Rt2 Rn Rt`, base Rn==x18 (caller-
+     * guaranteed). opc(31:30): 00=S(4B),01=D(8B),10=Q(16B),11=reserved. Pre/post-index declined. */
+    if ((instr & 0x3f800000) == 0x2d000000)
+    {
+        unsigned int ppc = instr >> 30, L = (instr >> 22) & 1;
+        unsigned int Rt2 = (instr >> 10) & 0x1f, ds;
+        int imm7 = (int)((instr >> 15) & 0x7f);
+        if (ppc == 3) return FALSE;                        /* reserved */
+        imm7 = (imm7 ^ 0x40) - 0x40;                       /* sign-extend 7 bits */
+        ds = 4u << ppc;                                    /* per-register datasize: 4 / 8 / 16 */
+        addr = (BYTE *)teb + (ULONG_PTR)((LONG_PTR)imm7 * (LONG_PTR)ds);
+        if (L) { teb_simd_load( context, Rt, addr, ds );  teb_simd_load( context, Rt2, addr + ds, ds ); }
+        else   { teb_simd_store( context, Rt, addr, ds ); teb_simd_store( context, Rt2, addr + ds, ds ); }
+        return TRUE;
+    }
+
+    {
+        unsigned int sz = instr >> 30, opc = (instr >> 22) & 3;
+        unsigned int esz = ((opc & 2) << 1) | sz;          /* 0..4 -> 8/16/32/64/128-bit */
+        unsigned int is_load = opc & 1, bytes;
+        if (esz > 4) return FALSE;                          /* unallocated size/opc combo */
+        bytes = 1u << esz;
+
+        if ((instr & 0x3f000000) == 0x3d000000)             /* LDR/STR (unsigned immediate) */
+        {
+            unsigned int imm12 = (instr >> 10) & 0xfff;
+            addr = (BYTE *)teb + ((ULONG_PTR)imm12 << esz);
+        }
+        else if ((instr & 0x3f200c00) == 0x3c000000)        /* LDUR/STUR (unscaled 9-bit signed imm) */
+        {
+            int imm9 = (int)((instr >> 12) & 0x1ff);
+            imm9 = (imm9 ^ 0x100) - 0x100;                  /* sign-extend 9 bits */
+            addr = (BYTE *)teb + imm9;
+        }
+        else if ((instr & 0x3f200c00) == 0x3c200800)        /* LDR/STR (register offset) [x18,Xm{,ext,shift}] */
+        {
+            unsigned int Rm = (instr >> 16) & 0x1f, option = (instr >> 13) & 7, S = (instr >> 12) & 1;
+            ULONG64 off = (Rm == 31) ? 0 : ((Rm == 18) ? teb : REGn_sig( Rm, context ));
+            if (!(option & 1))                              /* UXTW/SXTW: 32-bit index register */
+            {
+                off &= 0xffffffffull;
+                if (option & 4) off = (ULONG64)(LONG64)(int)(ULONG)off;   /* SXTW: sign-extend to 64 */
+            }
+            if (S) off <<= esz;                             /* scaled by access size when S==1 */
+            addr = (BYTE *)teb + off;
+        }
+        else return FALSE;                                  /* unhandled addressing form (incl. writeback) */
+
+        if (is_load) teb_simd_load( context, Rt, addr, bytes );
+        else         teb_simd_store( context, Rt, addr, bytes );
+        return TRUE;
+    }
+}
+
 static BOOL emulate_teb_load_store( ucontext_t *context, ULONG instr )
 {
     unsigned int size = instr >> 30, opc = (instr >> 22) & 3, Rt = instr & 0x1f, width;
     ULONG64 teb = (ULONG64)(ULONG_PTR)pthread_getspecific( teb_key );
     BYTE *addr;
+
+    if (instr & 0x04000000)                               /* V=1: SIMD/FP form -> parallel handler */
+        return emulate_teb_simd_load_store( context, instr );
 
     /* Load/store PAIR (offset, integer V=0): `opc 101 0 010 L imm7 Rt2 Rn Rt`, base Rn==x18 (caller-
      * guaranteed). opc: 00=32-bit, 10=64-bit, 01=LDPSW(load, sign-extend). imm7 signed, scaled by the
