@@ -1762,13 +1762,20 @@ void macdrv_window_got_focus(HWND hwnd, const macdrv_event *event)
           hwnd, event->window, event->window_got_focus.serial, NtUserIsWindowEnabled(hwnd),
           NtUserIsWindowVisible(hwnd), style, get_focus(), get_active_window(), NtUserGetForegroundWindow());
 
+    /* proton-mac Step-1/3 activation probe: is WINDOW_GOT_FOCUS delivered, and accepted or rejected? */
+    { static int n; if (n++ < 20) ERR("WGF-DELIVER hwnd=%p style=%08x canfg=%d minim=%d vis=%d fg=%p active=%p focus=%p\n",
+        hwnd, style, can_window_become_foreground(hwnd), !!(style & WS_MINIMIZE), NtUserIsWindowVisible(hwnd),
+        NtUserGetForegroundWindow(), get_active_window(), get_focus()); }
+
     if (can_window_become_foreground(hwnd) && !(style & WS_MINIMIZE))
     {
+        { static int n; if (n++ < 20) ERR("WGF-ACCEPT setting foreground to %p\n", hwnd); }
         TRACE("setting foreground window to %p\n", hwnd);
         NtUserSetForegroundWindowInternal(hwnd);
         return;
     }
 
+    { static int n; if (n++ < 20) ERR("WGF-REJECT %p (canfg=%d minim=%d)\n", hwnd, can_window_become_foreground(hwnd), !!(style & WS_MINIMIZE)); }
     TRACE("win %p/%p rejecting focus\n", hwnd, event->window);
     macdrv_window_rejected_focus(event);
 }
@@ -1820,6 +1827,7 @@ void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event)
  */
 void macdrv_app_activated(void)
 {
+    { static int n; if (n++ < 20) ERR("WGF-APPACTIVATED\n"); }   /* proton-mac Step-3 activation probe */
     TRACE("\n");
     macdrv_UpdateClipboard();
 }

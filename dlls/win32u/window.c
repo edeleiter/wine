@@ -1954,7 +1954,12 @@ BOOL get_window_rect_rel( HWND hwnd, enum coords_relative rel, RECT *rect, UINT 
 /* see GetWindowRect */
 BOOL get_window_rect( HWND hwnd, RECT *rect, UINT dpi )
 {
-    return get_window_rect_rel( hwnd, COORDS_SCREEN, rect, dpi );
+    BOOL r = get_window_rect_rel( hwnd, COORDS_SCREEN, rect, dpi );
+    /* proton-mac Step-3 poll probe: is the engine polling GetWindowRect, and what size does it get? */
+    { static int n; if (n++ < 20 || (n % 4000) == 0)
+        ERR( "GWRPROBE hwnd=%p ret=%d rect=%d,%d,%d,%d\n", hwnd, r,
+             (int)rect->left, (int)rect->top, (int)rect->right, (int)rect->bottom ); }
+    return r;
 }
 
 BOOL get_client_rect_rel( HWND hwnd, enum coords_relative rel, RECT *rect, UINT dpi )
@@ -1968,7 +1973,13 @@ BOOL get_client_rect_rel( HWND hwnd, enum coords_relative rel, RECT *rect, UINT 
 /* see GetClientRect */
 BOOL get_client_rect( HWND hwnd, RECT *rect, UINT dpi )
 {
-    return get_client_rect_rel( hwnd, COORDS_CLIENT, rect, dpi );
+    BOOL r = get_client_rect_rel( hwnd, COORDS_CLIENT, rect, dpi );
+    /* proton-mac Step-3 poll probe: is the engine polling GetClientRect (waiting for the window to reach the
+     * target 1600x900), and what client size does winemac report? */
+    { static int n; if (n++ < 20 || (n % 4000) == 0)
+        ERR( "GCRPROBE hwnd=%p ret=%d rect=%d,%d,%d,%d\n", hwnd, r,
+             (int)rect->left, (int)rect->top, (int)rect->right, (int)rect->bottom ); }
+    return r;
 }
 
 /* see GetWindowInfo */

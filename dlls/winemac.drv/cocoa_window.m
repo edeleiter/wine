@@ -2936,6 +2936,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         WineApplicationController* controller = [WineApplicationController sharedController];
         NSEvent* event = [controller lastFlagsChanged];
+        /* proton-mac Step-3 GENERATION probe: does the render NSWindow ever become key? */
+        { static int n; if (n++ < 20) ERR(@"WGF-GEN windowDidBecomeKey %p (causing=%d)\n", self, causing_becomeKeyWindow == self); }
         if (event)
             [self flagsChanged:event];
 
@@ -3486,9 +3488,14 @@ void macdrv_order_cocoa_window(macdrv_window w, macdrv_window p,
     WineWindow* next = (WineWindow*)n;
 
     OnMainThreadAsync(^{
+        /* proton-mac TEST (H1 causation): force activate. The headless/explorer-less run never activates the
+         * app, so the guest window never becomes key -> no WINDOW_GOT_FOCUS -> no WM_ACTIVATE -> the engine's
+         * bring-up pump spins forever (and the window stays black). Forcing activate:YES here runs orderBelow's
+         * existing tryToActivateIgnoringOtherApps path; if the engine then progresses, H1 is confirmed. */
+        { static int n; if (n++ < 3) ERR(@"WGF-FORCE order+activate window=%p (was activate=%d)\n", window, activate); }
         [window orderBelow:prev
                    orAbove:next
-                  activate:activate];
+                  activate:YES];
     });
     [window.queue discardEventsMatchingMask:event_mask_for_type(WINDOW_BROUGHT_FORWARD)
                                   forWindow:window];
