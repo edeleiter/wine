@@ -906,6 +906,27 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 
     spin_unlock( &queue->lock );
 
+    /* proton-mac: the standard futex double-check this code OMITS. RtlWaitOnAddress compares *addr only BEFORE
+     * publishing to the wait queue; if the producer's store to *addr becomes visible during the enqueue window
+     * (on our stack *addr is guest memory written by emulated x64 code, and its store can lag becoming visible
+     * to this native ARM64EC read), and the producer already ran RtlWakeAddress on an empty queue, the waiter
+     * would sleep forever. Re-validate after enqueue: if the value now differs, dequeue and don't sleep.
+     * `changed=1` here is the DROP-1 lost-wakeup witness (Probe A). */
+    if (entry.addr)
+    {
+        BOOL changed = !compare_addr( addr, cmp, size );
+        { static int n; if (n++ < 300)
+            ERR( "WOA-QUEUE tid=%04x addr=%p val=%08x cmp=%08x changed=%d\n",
+                 (unsigned)GetCurrentThreadId(), addr, *(const ULONG *)addr, *(const ULONG *)cmp, changed ); }
+        if (changed)
+        {
+            spin_lock( &queue->lock );
+            if (entry.addr) { list_remove( &entry.entry ); entry.addr = NULL; }
+            spin_unlock( &queue->lock );
+            return STATUS_SUCCESS;
+        }
+    }
+
     ret = NtWaitForAlertByThreadId( NULL, timeout );
 
     /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
@@ -930,7 +951,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
 {
     struct futex_queue *queue = get_futex_queue( addr );
     struct futex_entry *entry, *next;
-    unsigned int count = 0;
+    unsigned int count = 0, total = 0;
     HANDLE tids[256];
 
     TRACE("%p\n", addr);
@@ -954,12 +975,16 @@ void WINAPI RtlWakeAddressAll( const void *addr )
                 count = 0;
             }
             tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
+            total++;
         }
     }
 
     /* Try not to make a system call while holding a spinlock (even if that can be responsible for spurious wake
      * up scenario). */
     spin_unlock( &queue->lock );
+    /* proton-mac Probe B: woke=0 means the producer found NO waiter queued for addr (a waiter that raced-late
+     * due to the stale pre-enqueue compare = the DROP-1 producer-side witness). */
+    { static int n; if (n++ < 300) ERR( "WOA-WAKEALL addr=%p woke=%d\n", addr, total ); }
     if (count)
         NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
 }
@@ -1001,6 +1026,8 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
 
     spin_unlock( &queue->lock );
 
+    /* proton-mac Probe B: found=0 means no waiter was queued for addr (DROP-1 producer-side witness). */
+    { static int n; if (n++ < 300) ERR( "WOA-WAKE1 addr=%p tid=%04x found=%d\n", addr, (unsigned)tid, tid != 0 ); }
     if (tid) NtAlertThreadByThreadId( (HANDLE)(DWORD_PTR)tid );
 }
 
