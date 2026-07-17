@@ -6402,6 +6402,18 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
                 return STATUS_SUCCESS;
             }
             return STATUS_INVALID_HANDLE;
+
+        case MemoryFexTebTsdKey:   /* proton-mac: hand FEX the pthread teb_key so its Module.S can restore
+                                    * x18=TEB x18-free (TPIDRRO_EL0 TSD) after macOS zeroes x18, instead of
+                                    * storm-faulting every EC transition into the segv-net. */
+            if (process == GetCurrentProcess())
+            {
+                if (len < sizeof(ULONG_PTR)) return STATUS_INFO_LENGTH_MISMATCH;
+                *(ULONG_PTR *)buffer = (ULONG_PTR)teb_key;
+                if (res_len) *res_len = sizeof(ULONG_PTR);
+                return STATUS_SUCCESS;
+            }
+            return STATUS_INVALID_HANDLE;
 #endif
 
         case MemoryWineLoadUnixLib:

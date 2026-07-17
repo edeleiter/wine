@@ -2448,6 +2448,8 @@ typedef enum _MEMORY_INFORMATION_CLASS {
 #endif
     MemoryFexStatsShm = 2000,
     MemoryFexExecAlias = 2001,   /* proton-mac: return the RX exec alias for a FEX-dualmap JIT write base */
+    MemoryFexTebTsdKey = 2002,   /* proton-mac: hand FEX the pthread teb_key so Module.S can restore x18=TEB
+                                    x18-free (via TPIDRRO_EL0 TSD) instead of storm-faulting into the segv-net */
 } MEMORY_INFORMATION_CLASS;
 
 typedef struct _MEMORY_SECTION_NAME

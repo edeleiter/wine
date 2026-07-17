@@ -1143,6 +1143,10 @@ static inline void restore_teb_register(void)
  * to get faults/sec. Revert before ship. */
 unsigned long long g_x18_total = 0;
 unsigned long long g_x18_1788  = 0;
+/* proton-mac x18-perf baseline (throwaway; revert before ship): per-address-bucket counts + a periodic
+ * stderr log so we get fault rate + site attribution from /tmp/fex_run.log without fighting lldb. */
+unsigned long long g_x18_60   = 0;   /* Module.S check_target_ec  [x18,#0x60] */
+unsigned long long g_x18_378  = 0;   /* Wine dispatchers          [x18,#0x378] */
 
 /* proton-mac: emulate a faulting x18-based integer load/store IN the handler and advance PC,
  * instead of re-executing it on the cold RX page (whose first execution re-zeroes x18 -> the
@@ -1493,7 +1497,18 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             if (emulate_teb_load_store( context, instr ))
             {
                 g_x18_total++;                                             /* proton-mac Step-1 diag */
-                if ((ULONG_PTR)siginfo->si_addr == 0x1788) g_x18_1788++;   /* the ChpeV2CpuAreaInfo reload */
+                {   /* proton-mac x18-perf baseline: bucket by fault address + log every 262144 faults so an
+                     * external timer between two X18RATE lines yields faults/sec, and the buckets give the
+                     * site split (0x60 check_target_ec / 0x378 dispatchers / 0x1788 CpuArea / other). */
+                    ULONG_PTR a = (ULONG_PTR)siginfo->si_addr;
+                    if (a == 0x1788) g_x18_1788++;
+                    else if (a == 0x60) g_x18_60++;
+                    else if (a == 0x378) g_x18_378++;
+                    if (!(g_x18_total & 0x3ffff))
+                        ERR( "X18RATE total=%llu 0x60=%llu 0x378=%llu 0x1788=%llu other=%llu\n",
+                             g_x18_total, g_x18_60, g_x18_378, g_x18_1788,
+                             g_x18_total - g_x18_60 - g_x18_378 - g_x18_1788 );
+                }
                 PC_sig( context ) += 4;
                 return;
             }
