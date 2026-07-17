@@ -265,8 +265,28 @@ struct event *get_event_obj( struct process *process, obj_handle_t handle, unsig
     return (struct event *)get_handle_obj( process, handle, access, &event_ops );
 }
 
+/* proton-mac diagnostic (sync-delivery audit): per-object log cap so a rare worker-event signal is never
+ * starved out of the log by a hot unrelated event. tag selects an independent table (0=SETEV, 1=EVOP). */
+extern int diag_gen;
+static int diag_cap( int tag, void *key )
+{
+    static struct { void *k; int n; } slots[2][512];
+    static int gen;
+    unsigned int h = ((unsigned long)key >> 5) & 511, i;
+    if (gen != diag_gen) { memset( slots, 0, sizeof(slots) ); gen = diag_gen; }
+    for (i = 0; i < 512; i++)
+    {
+        unsigned int s = (h + i) & 511;
+        if (slots[tag][s].k == key) { if (slots[tag][s].n >= 8) return 0; slots[tag][s].n++; return 1; }
+        if (!slots[tag][s].k) { slots[tag][s].k = key; slots[tag][s].n = 1; return 1; }
+    }
+    return 0;
+}
+
 void set_event( struct event *event )
 {
+    if (diag_cap( 0, event->sync ))
+        fprintf( stderr, "SETEV sync=%p by_tid=%04x\n", event->sync, current ? current->id : 0 );
     signal_sync( event->sync );
 }
 
@@ -416,6 +436,10 @@ DECL_HANDLER(event_op)
     if (!(event = get_event_obj( current->process, req->handle, EVENT_MODIFY_STATE ))) return;
     assert( event->sync->ops == &event_sync_ops ); /* never called with inproc syncs */
     sync = (struct event_sync *)event->sync;
+
+    if (diag_cap( 1, event->sync ))
+        fprintf( stderr, "EVOP handle=%08x -> sync=%p by_tid=%04x op=%d\n",
+                 req->handle, event->sync, current ? current->id : 0, req->op );
 
     reply->state = sync->signaled;
     switch(req->op)

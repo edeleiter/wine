@@ -3532,7 +3532,12 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
     {
         LONG *futex = &entry->futex;
         if (!InterlockedExchange( futex, 1 ))
+        {
+            static int p4n; /* proton-mac sync-delivery audit: alert-channel dispatch (only real wakes) */
+            if (p4n++ < 2000) ERR( "ALERT target_tid=%p by=%04x\n",
+                                   tid, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
             futex_wake_one( futex );
+        }
         return STATUS_SUCCESS;
     }
 #elif defined(HAVE_KQUEUE)
@@ -3618,7 +3623,20 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
             else
                 ret = futex_wait( futex, 0, NULL );
 
-            if (ret == -1 && errno == ETIMEDOUT) return STATUS_TIMEOUT;
+            if (ret == -1 && errno == ETIMEDOUT)
+            {
+                static long p5t; /* proton-mac sync-delivery audit: alert-wait timeouts (rate-logged) */
+                if (p5t++ < 40 || p5t % 50000 == 0)
+                    ERR( "ALERTWAIT tid=%04x total=%ld ret=TIMEOUT\n",
+                         (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, p5t );
+                return STATUS_TIMEOUT;
+            }
+        }
+        {
+            static long p5a; /* proton-mac: alert-wait wakeups — a hot climb here == futex-never-blocks */
+            if (p5a++ < 40 || p5a % 50000 == 0)
+                ERR( "ALERTWAIT tid=%04x total=%ld ret=ALERTED\n",
+                     (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, p5a );
         }
         return STATUS_ALERTED;
     }

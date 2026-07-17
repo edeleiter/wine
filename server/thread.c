@@ -1057,11 +1057,14 @@ static int object_sync_signaled( struct object *obj, struct wait_queue_entry *en
  * using the server's own predicate (object_sync_signaled). Triggered by SIGHUP -> sighup_callback.
  * Discriminator: a parked thread on an already-signaled object => LOST-WAKEUP (substrate bug);
  * all objects unsignaled + a signaller cycle => APP-DEADLOCK (timing-exposed). Pure reads only. */
+int diag_gen; /* proton-mac sync-delivery audit: bumped on each dump so probe caps reset per window */
+
 void dump_wait_graph(void)
 {
     struct thread *thread;
     int nparked = 0;
 
+    diag_gen++;
     fprintf( stderr, "=== WAIT GRAPH DUMP (proton-mac diagnostic) ===\n" );
     LIST_FOR_EACH_ENTRY( thread, &thread_list, struct thread, entry )
     {
@@ -1223,6 +1226,24 @@ static int check_wait( struct thread *thread )
     return -1;
 }
 
+extern int diag_gen;
+
+/* proton-mac diagnostic (sync-delivery audit): per-object log cap (tag 0=WAKEUP). Resets per dump window. */
+static int diag_cap_wake( void *key )
+{
+    static struct { void *k; int n; } slots[512];
+    static int gen;
+    unsigned int h = ((unsigned long)key >> 5) & 511, i;
+    if (gen != diag_gen) { memset( slots, 0, sizeof(slots) ); gen = diag_gen; }
+    for (i = 0; i < 512; i++)
+    {
+        unsigned int s = (h + i) & 511;
+        if (slots[s].k == key) { if (slots[s].n >= 8) return 0; slots[s].n++; return 1; }
+        if (!slots[s].k) { slots[s].k = key; slots[s].n = 1; return 1; }
+    }
+    return 0;
+}
+
 /* send the wakeup signal to a thread */
 static int send_thread_wakeup( struct thread *thread, client_ptr_t cookie, int signaled )
 {
@@ -1245,7 +1266,13 @@ static int send_thread_wakeup( struct thread *thread, client_ptr_t cookie, int s
     reply.cookie   = cookie;
     reply.signaled = signaled;
     if ((ret = write( get_unix_fd( thread->wait_fd ), &reply, sizeof(reply) )) == sizeof(reply))
+    {
+        static int p3n, p3gen; /* proton-mac sync-delivery audit: wake actually delivered (resets per window) */
+        if (p3gen != diag_gen) { p3n = 0; p3gen = diag_gen; }
+        if (p3n++ < 20000) fprintf( stderr, "SENDWK tid=%04x cookie=%08lx signaled=%d\n",
+                                    thread->id, (unsigned long)cookie, signaled );
         return 0;
+    }
     if (ret >= 0)
         fatal_protocol_error( thread, "partial wakeup write %d\n", ret );
     else if (errno == EPIPE)
@@ -1420,6 +1447,9 @@ void wake_up( struct object *obj, int max )
 {
     struct list *ptr;
     int ret;
+
+    if (diag_cap_wake( obj )) /* proton-mac sync-delivery audit: signal reached the object's wait queue */
+        fprintf( stderr, "WAKEUP obj=%p max=%d\n", obj, max );
 
     LIST_FOR_EACH( ptr, &obj->wait_queue )
     {
