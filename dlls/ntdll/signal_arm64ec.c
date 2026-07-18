@@ -179,6 +179,13 @@ static void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64E
 
 static void arm64x_check_call(void);
 
+/* proton-mac (x18 perf): cached PEB->EcCodeBitMap (process-global, assigned once at unix/virtual.c:2982, never
+ * reallocated). arm64x_check_call reads the EC bitmap on EVERY EC indirect call via [x18,#0x60]; macOS zeroes x18
+ * on sigreturn, so that storm-faults into the segv-net. Reading the cached pointer is x18-free. 0 => not yet
+ * cached => arm64x_check_call falls back to the correct [x18,#0x60] path (never misdispatches). Plain .data C
+ * global, reached from the naked asm via the file's adrp/:lo12: pattern. */
+long long pm_ec_code_bitmap = 0;
+
 /*******************************************************************
  *         arm64ec_process_init
  */
@@ -228,6 +235,9 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     }
     if (!status && pThreadInit) status = pThreadInit();
     leave_syscall_callback();
+    /* proton-mac: cache the process-global EC bitmap (valid since the xtajit64 module load) before arming
+     * arm64x_check_call, so it reads the bitmap x18-free instead of storm-faulting [x18,#0x60] on every EC icall. */
+    pm_ec_code_bitmap = (long long)(ULONG_PTR)NtCurrentTeb()->Peb->EcCodeBitMap;
     __os_arm64x_check_call = arm64x_check_call;
     __os_arm64x_check_icall = arm64x_check_call;
     __os_arm64x_check_icall_cfg = arm64x_check_call;
@@ -1908,9 +1918,16 @@ static void __attribute__((naked)) arm64x_check_call(void)
     asm( ".seh_proc \"#arm64x_check_call\"\n\t"
          ".seh_endprologue\n\t"
          /* check for EC code */
-         "ldr x16, [x18, #0x60]\n\t"        /* peb */
-         "lsr x17, x11, #18\n\t"            /* dest / page_size / 64 */
+         /* proton-mac: read EcCodeBitMap from the cached process-global (x18-free); macOS zeroes x18 on sigreturn
+          * so [x18,#0x60] storm-faults on every EC icall. cbnz falls back to the correct x18 path if not yet
+          * cached (pm_ec_code_bitmap==0) so this NEVER misdispatches. */
+         "adrp x16, pm_ec_code_bitmap\n\t"
+         "ldr x16, [x16, #:lo12:pm_ec_code_bitmap]\n\t"
+         "cbnz x16, .Lhavemap\n\t"          /* cache valid -> x18-free (steady state) */
+         "ldr x16, [x18, #0x60]\n\t"        /* fallback: peb (segv-net corrects if x18==0) */
          "ldr x16, [x16, #0x368]\n\t"       /* peb->EcCodeBitMap */
+         ".Lhavemap:\n\t"
+         "lsr x17, x11, #18\n\t"            /* dest / page_size / 64 */
          "lsr x9, x11, #12\n\t"             /* dest / page_size */
          "ldr x16, [x16, x17, lsl #3]\n\t"
          "lsr x16, x16, x9\n\t"
